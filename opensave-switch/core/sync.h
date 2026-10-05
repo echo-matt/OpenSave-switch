@@ -45,10 +45,13 @@ typedef struct {
     char message[240];
 } os_cmp_result;
 
-/* Compares this Switch's save with the other device's. Asking also lets the
- * other device offer the game to its user when it does not track it yet. */
+/* Compares this Switch's save with the other device's. This only looks: a game
+ * the other device does not track is reported as OS_CMP_PC_LACKS and nothing is
+ * created there. With offer set, name and save_path are sent as well, which makes
+ * a device that does not track the game list it as offered to its user (to pick
+ * a folder for it) — do that only when the person asked for it. */
 void os_compare(os_state *s, const os_peer *p, const char *game_id, const char *name, const char *save_path,
-                const char *save_root, os_cmp_result *out);
+                const char *save_root, int offer, os_cmp_result *out);
 
 typedef struct {
     int already_same;
@@ -63,9 +66,8 @@ typedef struct {
  * staging_dir must be outside save_root. Returns 0 on success. On failure the
  * save is as it was (err says what happened, and if a restore itself failed it
  * says where the backup is). */
-int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *name, const char *save_path,
-            const char *save_root, const char *backup_dir, const char *staging_dir, const os_progress *pr,
-            os_pull_result *res, char *err, size_t errlen);
+int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *save_root, const char *backup_dir,
+            const char *staging_dir, const os_progress *pr, os_pull_result *res, char *err, size_t errlen);
 
 /* Puts a backup made by os_pull back: the save in save_root becomes exactly
  * what the backup holds. Returns 0 on success. The backup is verified against

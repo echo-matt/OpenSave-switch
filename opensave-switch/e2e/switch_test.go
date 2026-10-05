@@ -726,6 +726,54 @@ func TestFailedTransfersLeaveTheSaveAlone(t *testing.T) {
 	}
 }
 
+// TestCompareCreatesNothingOnThePC: looking at a game the PC does not have must
+// leave the PC untouched. Only an explicit offer lists it there.
+func TestCompareCreatesNothingOnThePC(t *testing.T) {
+	s := newPC(t)
+	sw := newSwitch(t)
+	pair(t, sw, s)
+	const other = "0100AAAAAAAAAAAA"
+	if err := os.MkdirAll(filepath.Join(sw.saves, other), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sw.saves, other, "main"), []byte("x"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	games := func() int {
+		g, err := s.pc.Daemon.Store.ListGames()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(g)
+	}
+	offered := func() int {
+		o, err := s.pc.Daemon.Store.ListOfferedGames()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(o)
+	}
+	before := games()
+
+	out := sw.run(30*time.Second, "compare", other)
+	if !strings.Contains(out, "COMPARE state=2") || !strings.Contains(out, "not found") {
+		t.Fatalf("compare of a game the PC lacks: %s", out)
+	}
+	if games() != before || offered() != 0 {
+		t.Fatalf("a compare changed the PC: %d games (was %d), %d offered", games(), before, offered())
+	}
+
+	// An explicit offer is what makes it appear — as an offer, never as a
+	// tracked game at a folder the Switch made up.
+	sw.run(30*time.Second, "offer", other)
+	if offered() != 1 {
+		t.Fatalf("an explicit offer should list the game on the PC, got %d offered", offered())
+	}
+	if games() != before {
+		t.Fatalf("an offer must not track a game by itself: %d games (was %d)", games(), before)
+	}
+}
+
 // TestRestoreBackup: the backup a pull makes can be put back, exactly.
 func TestRestoreBackup(t *testing.T) {
 	s := newPC(t)

@@ -238,7 +238,14 @@ int os_peer_fetch_manifest(os_state *s, const os_peer *p, const char *game_id, c
     os_url_escape(eg, sizeof eg, game_id);
     os_url_escape(en, sizeof en, name ? name : "");
     os_url_escape(es, sizeof es, save_path ? save_path : "");
-    snprintf(target, sizeof target, "/api/p2p/manifest/%s?name=%s&savePath=%s&isFile=false", eg, en, es);
+    /* Without a name and path the other device can only say whether it knows
+     * the game. With them, a device that does not know it records the game as
+     * offered to its user — a side effect on somebody else's screen, so it is
+     * only asked for when the person chose to offer the game. */
+    if (name && *name && save_path && *save_path)
+        snprintf(target, sizeof target, "/api/p2p/manifest/%s?name=%s&savePath=%s&isFile=false", eg, en, es);
+    else
+        snprintf(target, sizeof target, "/api/p2p/manifest/%s", eg);
     if (os_peer_call(s, p, "GET", target, NULL, 0, 16 * 1024 * 1024, SYNC_TIMEOUT_MS, &r, &status, err, errlen) != 0)
         return -1;
     d = os_json_parse(r.body, r.bodylen, err, errlen);

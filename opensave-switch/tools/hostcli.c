@@ -13,7 +13,7 @@
  *             --port N       port to listen on (default 0 = any)
  *             --auto-approve approve pairing requests received from a device
  *             --name NAME    device name
- *   commands: ping IP PORT | pair IP PORT [SECS] | serve SECS | compare TITLE |
+ *   commands: ping IP PORT | pair IP PORT [SECS] | serve SECS | compare TITLE | offer TITLE |
  *             pull TITLE [LINGER] | push TITLE [SECS] | restore TITLE | unpair | info
  *
  * Output is line-oriented ("PAIRED ...", "PULL OK ...") for the tests to read.
@@ -224,14 +224,15 @@ int main(int argc, char **argv) {
                     }
             }
         }
-    } else if (!strcmp(cmd[0], "compare") && argc - i >= 2) {
+    } else if ((!strcmp(cmd[0], "compare") || !strcmp(cmd[0], "offer")) && argc - i >= 2) {
+        int offer = !strcmp(cmd[0], "offer");
         char game[128], gname[128], path[128], root[300];
         os_cmp_result r;
         if (need_peer(&peer) != 0) return 1;
         resolve(peer, cmd[1], game, sizeof game, gname, sizeof gname);
         os_save_path_for_title(path, sizeof path, cmd[1]);
         snprintf(root, sizeof root, "%s/%s", saves_dir, cmd[1]);
-        os_compare(&st, peer, game, gname, path, root, &r);
+        os_compare(&st, peer, game, gname, path, root, offer, &r);
         printf("COMPARE state=%d only_remote=%d only_local=%d differ=%d message=\"%s\"\n", (int)r.state, r.only_remote,
                r.only_local, r.differ, r.message);
     } else if (!strcmp(cmd[0], "pull") && argc - i >= 2) {
@@ -247,7 +248,7 @@ int main(int argc, char **argv) {
         snprintf(staging, sizeof staging, "%s/staging/%s", work_dir, cmd[1]);
         memset(&pr, 0, sizeof pr);
         pr.progress = progress;
-        if (os_pull(&st, peer, game, gname, path, root, backup, staging, &pr, &r, err, sizeof err) != 0) {
+        if (os_pull(&st, peer, game, root, backup, staging, &pr, &r, err, sizeof err) != 0) {
             printf("PULL FAIL %s\n", err);
             rc = 1;
         } else {

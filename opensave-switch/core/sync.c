@@ -21,14 +21,14 @@ static int stopped(const os_progress *pr) { return pr && pr->cancelled && pr->ca
 /* ------------------------------------------------------------------ compare */
 
 void os_compare(os_state *s, const os_peer *p, const char *game_id, const char *name, const char *save_path,
-                const char *save_root, os_cmp_result *out) {
+                const char *save_root, int offer, os_cmp_result *out) {
     os_remote_manifest rm;
     os_manifest lm;
     char err[160], h1[65], h2[65];
     int missing, i;
 
     memset(out, 0, sizeof *out);
-    if (os_peer_fetch_manifest(s, p, game_id, name, save_path, &rm, err, sizeof err) != 0) {
+    if (os_peer_fetch_manifest(s, p, game_id, offer ? name : NULL, offer ? save_path : NULL, &rm, err, sizeof err) != 0) {
         /* The other device's own words say whether it simply does not have the
          * game or something is wrong; either way the person is told. */
         out->state = (strstr(err, "not found") || strstr(err, "folder for this game")) ? OS_CMP_PC_LACKS : OS_CMP_ERROR;
@@ -162,9 +162,8 @@ static int fetch_file(os_state *s, const os_peer *p, const char *game_id, const 
     return 0;
 }
 
-int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *name, const char *save_path,
-            const char *save_root, const char *backup_dir, const char *staging_dir, const os_progress *pr,
-            os_pull_result *res, char *err, size_t errlen) {
+int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *save_root, const char *backup_dir,
+            const char *staging_dir, const os_progress *pr, os_pull_result *res, char *err, size_t errlen) {
     os_remote_manifest rm;
     os_manifest lm, after;
     int missing, i, rc = -1, had_backup = 0, applying = 0;
@@ -179,7 +178,7 @@ int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *name
     if (err && errlen) err[0] = '\0';
 
     tick(pr, "Asking the PC what it has", 0, 0);
-    if (os_peer_fetch_manifest(s, p, game_id, name, save_path, &rm, err, errlen) != 0) return -1;
+    if (os_peer_fetch_manifest(s, p, game_id, NULL, NULL, &rm, err, errlen) != 0) return -1;
     res->remote_has_extra_roots = rm.manifest.has_extra_roots;
     os_manifest_hash(&rm.manifest, res->manifest_hash);
 

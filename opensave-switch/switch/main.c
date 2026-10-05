@@ -499,7 +499,7 @@ static void prune_backups(const char *tid) {
     }
 }
 
-static void do_pull(const saves_title *t, const char *game_id, const char *name, const char *save_path) {
+static void do_pull(const saves_title *t, const char *game_id, const char *name) {
     char backup[400], staging[300], err[400], stamp[32], head[300], msg[400];
     os_pull_result res;
     os_progress pr;
@@ -524,7 +524,7 @@ static void do_pull(const saves_title *t, const char *game_id, const char *name,
     pr.progress = on_progress;
     pr.cancelled = on_cancel;
 
-    if (os_pull(&g_st, p, game_id, name, save_path, SAVES_MOUNT_ROOT, backup, staging, &pr, &res, err, sizeof err) != 0) {
+    if (os_pull(&g_st, p, game_id, SAVES_MOUNT_ROOT, backup, staging, &pr, &res, err, sizeof err) != 0) {
         saves_unmount(); /* nothing was committed: the save is as it was */
         show_result(UI_ERR, "Nothing was changed", err);
         return;
@@ -616,7 +616,7 @@ typedef struct {
 } game_t;
 static void d_game(gfx *g, void *a) { ui_game(g, &((game_t *)a)->v); }
 
-enum { ACT_RECEIVE, ACT_SEND, ACT_RESTORE, ACT_AGAIN };
+enum { ACT_RECEIVE, ACT_SEND, ACT_RESTORE, ACT_AGAIN, ACT_OFFER };
 
 static void game_screen(const saves_title *t) {
     char err[300], game_id[128], name[128], path[160], backup[400];
@@ -649,7 +649,7 @@ static void game_screen(const saves_title *t) {
                 return;
             }
             if (found == 1) snprintf(game_id, sizeof game_id, "%s", rg.id); /* the PC's own id */
-            os_compare(&g_st, p, game_id, name, path, SAVES_MOUNT_ROOT, &cmp);
+            os_compare(&g_st, p, game_id, name, path, SAVES_MOUNT_ROOT, 0, &cmp);
             newest_backup(t->tid, backup, sizeof backup);
 
             memset(&gv, 0, sizeof gv);
@@ -673,7 +673,7 @@ static void game_screen(const saves_title *t) {
                 gv.v.status_kind = UI_WARN;
                 snprintf(gv.status, sizeof gv.status, "The PC does not have this game yet");
                 snprintf(gv.detail, sizeof gv.detail,
-                         "It was offered to OpenSave on the PC: choose its save folder there, then check again.");
+                         "Nothing has been sent. To sync it, the PC needs this game's Switch save in an emulator folder, or you can offer it.");
                 break;
             default:
                 gv.v.status_kind = UI_ERR;
@@ -693,6 +693,7 @@ static void game_screen(const saves_title *t) {
                 actions[nact++] = ACT_RECEIVE;
                 actions[nact++] = ACT_SEND;
             }
+            if (cmp.state == OS_CMP_PC_LACKS) actions[nact++] = ACT_OFFER;
             if (backup[0]) actions[nact++] = ACT_RESTORE;
             actions[nact++] = ACT_AGAIN;
             for (i = 0; i < nact; i++) {
@@ -705,6 +706,10 @@ static void game_screen(const saves_title *t) {
                 case ACT_SEND:
                     gv.actions[i] = "Send to the PC";
                     gv.help[i] = "Ask the PC to take this Switch's save.";
+                    break;
+                case ACT_OFFER:
+                    gv.actions[i] = "Offer to the PC";
+                    gv.help[i] = "Show this game on the PC's Home screen, where you choose its save folder.";
                     break;
                 case ACT_RESTORE:
                     gv.actions[i] = "Restore the last backup";
@@ -735,9 +740,17 @@ static void game_screen(const saves_title *t) {
                 if (confirm(d_game, &gv, UI_WARN, "Replace this Switch's save?",
                             "The current save is backed up on the SD card first, so you can put it back.", NULL, "Replace",
                             "Cancel"))
-                    do_pull(t, game_id, name, path);
+                    do_pull(t, game_id, name);
                 break;
             case ACT_SEND: do_push(game_id); break;
+            case ACT_OFFER: {
+                os_cmp_result o;
+                show_busy("Offering to the PC", t->name);
+                os_compare(&g_st, p, game_id, name, path, SAVES_MOUNT_ROOT, 1, &o);
+                show_result(UI_INFO, "Offered to the PC",
+                            "Open OpenSave on the PC: the game is on Home, waiting for you to choose its save folder. Then check again here.");
+                break;
+            }
             case ACT_RESTORE: do_restore(t, d_game, &gv); break;
             default: break;
             }
