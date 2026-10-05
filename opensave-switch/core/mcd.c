@@ -6,12 +6,14 @@
 #include <string.h>
 #include <strings.h>
 
+#include "aes.h"
 #include "crypto.h"
 #include "fsutil.h"
 #include "json.h"
 #include "manifest.h"
+#include "mcd_key.h"
 
-#define MAX_SAVE_BYTES (3 * 1000 * 1000) /* the service's own request limit */
+#define MAX_SAVE_BYTES (3 * 1000 * 1000) /* far above any character */
 #define MAX_CHARS 256
 #define SW_PREFIX "Character"
 
@@ -37,276 +39,82 @@ int os_mcd_is_character(const uint8_t *json, size_t n) {
     return ok;
 }
 
-/* ------------------------------------------------------------- the service */
+/* ------------------------------------------------------------------ cipher */
 
-static int parse_url(const char *url, int *tls, char *host, size_t hl, int *port, char *prefix, size_t pl) {
-    const char *p = url, *h, *e;
-    size_t n;
-    if (strncmp(p, "https://", 8) == 0) {
-        *tls = 1;
-        p += 8;
-        *port = 443;
-    } else if (strncmp(p, "http://", 7) == 0) {
-        *tls = 0;
-        p += 7;
-        *port = 80;
-    } else {
-        return -1;
-    }
-    h = p;
-    e = h + strcspn(h, "/:");
-    n = (size_t)(e - h);
-    if (n == 0 || n >= hl) return -1;
-    memcpy(host, h, n);
-    host[n] = '\0';
-    if (*e == ':') {
-        *port = atoi(e + 1);
-        e += 1 + strspn(e + 1, "0123456789");
-        if (*port <= 0 || *port > 65535) return -1;
-    }
-    snprintf(prefix, pl, "%s", *e ? e : "/");
-    n = strlen(prefix);
-    if (n && prefix[n - 1] != '/' && n + 1 < pl) {
-        prefix[n] = '/';
-        prefix[n + 1] = '\0';
-    }
-    return 0;
-}
-
-/* The host without a leading "www.", for comparing sites. */
-static const char *bare_host(const char *h) { return strncasecmp(h, "www.", 4) == 0 ? h + 4 : h; }
-
-/* Accepts a redirect's Location only if it stays on the same site: the same
- * scheme (never https to http), and the same host or its www. form. Updates the
- * request target. Returns 0 if it may be followed. */
-static int follow_redirect(const char *loc, int *tls, char *host, size_t hl, int *port, char *target, size_t tl,
-                           const char *first_host) {
-    int ntls = *tls, nport = *port;
-    char nhost[128], path[300];
-    const char *p = loc;
-    if (!loc[0]) return -1;
-    if (loc[0] == '/') { /* a path on the same host */
-        snprintf(target, tl, "%s", loc);
-        return 0;
-    }
-    if (strncmp(p, "https://", 8) == 0) {
-        ntls = 1;
-        p += 8;
-        nport = 443;
-    } else if (strncmp(p, "http://", 7) == 0) {
-        ntls = 0;
-        p += 7;
-        nport = 80;
-    } else {
-        return -1;
-    }
-    if (ntls != *tls) return -1; /* never change scheme: no downgrade, and no surprise upgrade */
-    {
-        size_t n = strcspn(p, "/:");
-        if (n == 0 || n >= sizeof nhost) return -1;
-        memcpy(nhost, p, n);
-        nhost[n] = '\0';
-        p += n;
-    }
-    if (*p == ':') {
-        nport = atoi(p + 1);
-        p += 1 + strspn(p + 1, "0123456789");
-        if (nport <= 0 || nport > 65535) return -1;
-    }
-    snprintf(path, sizeof path, "%s", *p ? p : "/");
-    if (strcasecmp(bare_host(nhost), bare_host(first_host)) != 0) return -1;
-    snprintf(host, hl, "%s", nhost);
-    *port = nport;
-    *tls = ntls;
-    snprintf(target, tl, "%s", path);
-    return 0;
-}
-
-/* Decodes base64 whether or not its padding is present: the service leaves it off. */
-static int b64_loose(const char *in, uint8_t **out, size_t *outn) {
-    size_t n = strlen(in), padded;
-    char *tmp;
-    uint8_t *buf;
-    long got;
-    while (n && (in[n - 1] == '=' || in[n - 1] == '\n' || in[n - 1] == '\r')) n--;
-    padded = (n + 3) / 4 * 4;
-    tmp = (char *)malloc(padded + 1);
-    buf = (uint8_t *)malloc(padded / 4 * 3 + 3);
-    if (!tmp || !buf) {
-        free(tmp);
-        free(buf);
-        return -1;
-    }
-    memcpy(tmp, in, n);
-    memset(tmp + n, '=', padded - n);
-    tmp[padded] = '\0';
-    got = os_b64_decode(buf, tmp, padded);
-    free(tmp);
-    if (got < 0) {
-        free(buf);
-        return -1;
-    }
-    *out = buf;
-    *outn = (size_t)got;
-    return 0;
-}
-
-/* One call: send {"<field>": base64(in)}, read the answer's other field. */
-static int service_call(const char *base, const char *endpoint, const char *send_field, const char *recv_field,
-                        const uint8_t *in, size_t n, uint8_t **out, size_t *outn, char *err, size_t errlen) {
-    char host[128], prefix[160], target[320], terr[160];
-    int tls, port, status_ok = 0;
-    os_sb sb;
-    char *body, *b64;
-    size_t bl;
-    os_http_resp r;
-    os_json *d;
-    os_jn root, v;
-    const char *val;
-    char key2[24];
-
-    if (n == 0 || n > MAX_SAVE_BYTES) {
-        seterr(err, errlen, "that save is too large to convert");
-        return -1;
-    }
-    if (parse_url(base, &tls, host, sizeof host, &port, prefix, sizeof prefix) != 0) {
-        seterr(err, errlen, "the conversion service address is not valid");
-        return -1;
-    }
-    snprintf(target, sizeof target, "%sapi/encryption/%s", prefix, endpoint);
-    b64 = (char *)malloc(os_b64_encoded_len(n) + 1);
-    if (!b64) {
-        seterr(err, errlen, "out of memory");
-        return -1;
-    }
-    os_b64_encode(b64, in, n);
-    os_sb_init(&sb);
-    os_sb_printf(&sb, "{\"%s\":\"%s\"}", send_field, b64);
-    free(b64);
-    body = os_sb_take(&sb, &bl);
-    if (!body) {
-        seterr(err, errlen, "out of memory");
-        return -1;
-    }
-    {
-        /* A redirect is followed — with the same body, as a POST — but only to the
-         * same site: another host would be sending a save wherever a server says. */
-        char first_host[128];
-        int hops;
-        snprintf(first_host, sizeof first_host, "%s", host);
-        for (hops = 0;; hops++) {
-            if (os_http_request_tls(host, port, tls, "POST", target, NULL, 0, body, bl, 8 * 1000 * 1000, 30000, &r, terr,
-                                    sizeof terr) != 0) {
-                free(body);
-                snprintf(err, errlen, "could not reach the conversion service: %s", terr);
-                return -1;
-            }
-            if (!(r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308)) break;
-            if (hops >= 3 || follow_redirect(r.location, &tls, host, sizeof host, &port, target, sizeof target, first_host) != 0) {
-                snprintf(err, errlen, "the conversion service redirected to %s%s", r.location[0] ? r.location : "(nowhere)",
-                         hops >= 3 ? ", too many times" : ", which is not the same site, so nothing was sent there");
-                os_http_resp_free(&r);
-                free(body);
-                return -1;
-            }
-            os_http_resp_free(&r);
-        }
-        free(body);
-    }
-    status_ok = r.status == 200;
-    if (!status_ok) {
-        snprintf(err, errlen, "the conversion service answered HTTP %d", r.status);
-        os_http_resp_free(&r);
-        return -1;
-    }
-    d = os_json_parse(r.body, r.bodylen, NULL, 0);
-    os_http_resp_free(&r);
-    if (!d) {
-        seterr(err, errlen, "the conversion service sent an unreadable reply");
-        return -1;
-    }
-    root = os_json_root(d);
-    /* The service names its fields in camelCase; accept either spelling. */
-    v = os_json_get(d, root, recv_field);
-    if (v == OS_JN_NONE) {
-        snprintf(key2, sizeof key2, "%c%s", (char)toupper((unsigned char)recv_field[0]), recv_field + 1);
-        v = os_json_get(d, root, key2);
-    }
-    val = os_json_str(d, v);
-    if (!val || !*val || b64_loose(val, out, outn) != 0) {
-        os_json_free(d);
-        seterr(err, errlen, "the conversion service returned nothing usable");
-        return -1;
-    }
-    os_json_free(d);
-    return 0;
-}
-
-int os_conv_decrypt(const char *base, const uint8_t *enc, size_t n, uint8_t **out, size_t *outn, char *err,
-                    size_t errlen) {
-    if (service_call(base, "decrypt", "Encrypted", "decrypted", enc, n, out, outn, err, errlen) != 0) return -1;
-    /* The cipher pads with zeros; the service removes them, but be sure. */
-    while (*outn && (*out)[*outn - 1] == 0) (*outn)--;
-    return 0;
-}
-
-int os_conv_encrypt(const char *base, const uint8_t *plain, size_t n, uint8_t **out, size_t *outn, char *err,
-                    size_t errlen) {
-    if (service_call(base, "encrypt", "Decrypted", "encrypted", plain, n, out, outn, err, errlen) != 0) return -1;
-    if (*outn == 0 || *outn % 16 != 0) {
-        free(*out);
-        *out = NULL;
-        seterr(err, errlen, "the conversion service returned data that is not an encrypted save");
-        return -1;
-    }
-    return 0;
-}
-
-int os_mcd_decrypt_dat(const char *base, const uint8_t *dat, size_t n, uint8_t **json, size_t *jn, char *err,
-                       size_t errlen) {
+int os_mcd_decrypt_dat(const uint8_t *dat, size_t n, uint8_t **json, size_t *jn, char *err, size_t errlen) {
+    os_aes256 a;
+    uint8_t *out;
+    size_t body = n - sizeof MAGIC, i;
     if (!os_mcd_is_dat(dat, n)) {
         seterr(err, errlen, "that is not an encrypted Minecraft Dungeons save");
         return -1;
     }
-    if (os_conv_decrypt(base, dat + sizeof MAGIC, n - sizeof MAGIC, json, jn, err, errlen) != 0) return -1;
-    if (!os_mcd_is_character(*json, *jn)) {
-        free(*json);
-        *json = NULL;
+    if (body % 16 != 0) {
+        seterr(err, errlen, "that save is damaged (its size is not a whole number of cipher blocks)");
+        return -1;
+    }
+    out = (uint8_t *)malloc(body + 1);
+    if (!out) {
+        seterr(err, errlen, "out of memory");
+        return -1;
+    }
+    os_aes256_init(&a, OS_MCD_KEY);
+    for (i = 0; i < body; i += 16) os_aes256_decrypt_block(&a, dat + sizeof MAGIC + i, out + i);
+    /* The cipher pads with zeros, which are not part of the JSON. */
+    while (body && out[body - 1] == 0) body--;
+    out[body] = '\0';
+    if (!os_mcd_is_character(out, body)) {
+        free(out);
         return 1;
     }
+    *json = out;
+    *jn = body;
     return 0;
 }
 
-int os_mcd_encrypt_json(const char *base, const uint8_t *json, size_t n, uint8_t **dat, size_t *dn, char *err,
-                        size_t errlen) {
-    uint8_t *enc = NULL, *back = NULL;
-    size_t en = 0, bn = 0;
+int os_mcd_encrypt_json(const uint8_t *json, size_t n, uint8_t **dat, size_t *dn, char *err, size_t errlen) {
+    os_aes256 a;
+    uint8_t *out, *back = NULL;
+    size_t padded = (n + 15) / 16 * 16, i, bn = 0;
+    int rc;
     if (!os_mcd_is_character(json, n)) {
         seterr(err, errlen, "that file is not a character save");
         return -1;
     }
-    if (os_conv_encrypt(base, json, n, &enc, &en, err, errlen) != 0) return -1;
-    if (os_conv_decrypt(base, enc, en, &back, &bn, err, errlen) != 0) {
-        free(enc);
+    if (memchr(json, 0, n)) {
+        /* Zero is the padding, so a zero inside the data could not be told from it. */
+        seterr(err, errlen, "that character contains a zero byte and cannot be encrypted unambiguously");
         return -1;
     }
-    if (bn != n || memcmp(back, json, n) != 0) {
-        free(enc);
+    out = (uint8_t *)calloc(1, sizeof MAGIC + padded);
+    if (!out) {
+        seterr(err, errlen, "out of memory");
+        return -1;
+    }
+    memcpy(out, MAGIC, sizeof MAGIC);
+    {
+        uint8_t *plain = (uint8_t *)calloc(1, padded);
+        if (!plain) {
+            free(out);
+            seterr(err, errlen, "out of memory");
+            return -1;
+        }
+        memcpy(plain, json, n);
+        os_aes256_init(&a, OS_MCD_KEY);
+        for (i = 0; i < padded; i += 16) os_aes256_encrypt_block(&a, plain + i, out + sizeof MAGIC + i);
+        free(plain);
+    }
+    /* Prove it reads back as what went in, as the game will have to. */
+    rc = os_mcd_decrypt_dat(out, sizeof MAGIC + padded, &back, &bn, err, errlen);
+    if (rc != 0 || bn != n || memcmp(back, json, n) != 0) {
+        free(out);
         free(back);
         seterr(err, errlen, "the encrypted save did not decrypt back to the original, so it was not used");
         return -1;
     }
     free(back);
-    *dat = (uint8_t *)malloc(sizeof MAGIC + en);
-    if (!*dat) {
-        free(enc);
-        seterr(err, errlen, "out of memory");
-        return -1;
-    }
-    memcpy(*dat, MAGIC, sizeof MAGIC);
-    memcpy(*dat + sizeof MAGIC, enc, en);
-    *dn = sizeof MAGIC + en;
-    free(enc);
+    *dat = out;
+    *dn = sizeof MAGIC + padded;
     return 0;
 }
 
@@ -569,9 +377,8 @@ static void free_convs(conv *c, int n) {
     free(c);
 }
 
-int os_mcd_pull(os_state *s, const os_peer *p, const os_link *l, const char *service_url, const char *save_root,
-                const char *convert_dir, const char *backup_dir, const os_progress *pr, os_mcd_result *res,
-                char *err, size_t errlen) {
+int os_mcd_pull(os_state *s, const os_peer *p, const os_link *l, const char *save_root, const char *convert_dir,
+                const char *backup_dir, const os_progress *pr, os_mcd_result *res, char *err, size_t errlen) {
     os_remote_manifest rm;
     os_manifest mm, lm, after;
     cstate cs;
@@ -619,7 +426,7 @@ int os_mcd_pull(os_state *s, const os_peer *p, const os_link *l, const char *ser
     res->bytes = done;
 
     /* Work out every Switch file to write, decrypting first, so that a failure of
-     * the service leaves nothing touched. */
+     * a failure leaves nothing touched. */
     convs = (conv *)calloc((size_t)(rm.manifest.nfiles ? rm.manifest.nfiles : 1), sizeof *convs);
     if (!convs) {
         seterr(err, errlen, "out of memory");
@@ -639,7 +446,7 @@ int os_mcd_pull(os_state *s, const os_peer *p, const os_link *l, const char *ser
         for (j = 0; j < nwant; j++)
             if (want[j] == i) changed = 1;
         /* An unchanged file whose Switch copy still matches what was written last
-         * time needs nothing: no need to ask the service again. */
+         * time needs nothing: nothing to encrypt again. */
         {
             char name[200];
             snprintf(name, sizeof name, "%s%s", SW_PREFIX, guid);
@@ -662,10 +469,9 @@ int os_mcd_pull(os_state *s, const os_peer *p, const os_link *l, const char *ser
             continue;
         }
         if (pr && pr->progress) pr->progress(pr->ctx, "Converting a character", 0, 0);
-        rcd = os_mcd_decrypt_dat(service_url, dat, dn, &json, &jn, err, errlen);
+        rcd = os_mcd_decrypt_dat(dat, dn, &json, &jn, NULL, 0);
         free(dat);
-        if (rcd < 0) goto out;
-        if (rcd == 1) {
+        if (rcd != 0) { /* damaged, or not a character: left alone, and the rest still convert */
             res->skipped++;
             continue;
         }
@@ -805,8 +611,7 @@ out:
 
 /* -------------------------------------------------------------------- send */
 
-int os_mcd_prepare_send(const char *service_url, const char *save_root, const char *convert_dir, int *prepared,
-                        char *err, size_t errlen) {
+int os_mcd_prepare_send(const char *save_root, const char *convert_dir, int *prepared, char *err, size_t errlen) {
     cstate cs;
     swchar *chars;
     int n, i, ok = -1;
@@ -871,7 +676,7 @@ int os_mcd_prepare_send(const char *service_url, const char *save_root, const ch
                 goto out;
             }
         }
-        if (os_mcd_encrypt_json(service_url, json, jn, &items[nitems].dat, &items[nitems].dn, err, errlen) != 0) {
+        if (os_mcd_encrypt_json(json, jn, &items[nitems].dat, &items[nitems].dn, err, errlen) != 0) {
             free(json);
             goto out;
         }

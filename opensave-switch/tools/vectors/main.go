@@ -5,6 +5,7 @@
 package main
 
 import (
+	"crypto/aes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -89,6 +90,13 @@ func main() {
 			e2ee.RequestMAC(key, from, to, route, "GET", body, nonce, ms))
 		fmt.Printf("respmac %s %s %s %s %d %s %s %d %s\n", hex.EncodeToString(key), from, to, "msg-"+fmt.Sprint(i), 200, hx(body), nonce, ms,
 			e2ee.ResponseMAC(key, from, to, "msg-"+fmt.Sprint(i), 200, body, nonce, ms))
+	}
+	for i := 0; i < 60; i++ {
+		key, pt := rnd(32), rnd(16)
+		blk, _ := aes.NewCipher(key)
+		ct := make([]byte, 16)
+		blk.Encrypt(ct, pt)
+		fmt.Printf("aes256 %s %s %s\n", hx(key), hx(pt), hx(ct))
 	}
 	// RFC 7748 section 5.2 vectors.
 	for _, v := range [][3]string{

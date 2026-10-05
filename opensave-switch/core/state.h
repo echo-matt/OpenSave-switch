@@ -62,8 +62,6 @@ typedef struct {
     uint8_t pub[32];
     os_peer peers[OS_MAX_PEERS];
     os_link links[OS_MAX_LINKS];
-    int convert_consent; /* the person agreed to send saves to the conversion service */
-    char convert_url[200];
 
     /* Not persisted. */
     os_sent sent[OS_MAX_PENDING];

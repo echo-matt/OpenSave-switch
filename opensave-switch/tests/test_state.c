@@ -40,10 +40,8 @@ static void test_roundtrip(const char *dir) {
         CHECK(os_auth_key(theirs_key, other_priv, b.pub) == 0);
         CHECK(memcmp(p->authkey, theirs_key, 32) == 0);
     }
-    /* Links and the conversion consent are remembered too. */
+    /* Links are remembered too. */
     CHECK(os_state_set_link(&a, "01006c100ec08000", "minecraft-dungeons-saved", "Minecraft Dungeons (Saved)") != NULL);
-    a.convert_consent = 1;
-    snprintf(a.convert_url, sizeof a.convert_url, "https://dungeons.tools/");
     CHECK(os_state_save(&a, err, sizeof err) == 0);
     {
         os_state c;
@@ -52,7 +50,6 @@ static void test_roundtrip(const char *dir) {
         l = os_state_find_link(&c, "01006C100EC08000"); /* title ids compare without case */
         CHECK(l != NULL && !strcmp(l->game_id, "minecraft-dungeons-saved") && !strcmp(l->name, "Minecraft Dungeons (Saved)"));
         CHECK(os_state_find_link_by_game(&c, "minecraft-dungeons-saved") == l);
-        CHECK(c.convert_consent == 1 && !strcmp(c.convert_url, "https://dungeons.tools/"));
         CHECK(os_state_set_link(&c, "01006C100EC08000", "other-id", "x") == l && !strcmp(l->game_id, "other-id")); /* replaces */
         os_state_remove_link(&c, "01006C100EC08000");
         CHECK(os_state_find_link(&c, "01006C100EC08000") == NULL);

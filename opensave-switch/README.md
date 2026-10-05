@@ -88,8 +88,7 @@ JSON, but Windows encrypts it into a `.dat` file. The app converts between the t
 1. On the PC, track the folder that holds the game's Windows save (the one with
    the `<id>.dat` character files, or a folder above it) in OpenSave.
 2. On the Switch, open Minecraft Dungeons and choose **Use a Windows save from the
-   PC**, then pick that PC game. The first time, you are asked to allow the
-   conversion service (below).
+   PC**, then pick that PC game.
 3. **Receive from the PC** converts the Windows characters and writes them as
    `Character<id>` files into the Switch save (backed up first).
    **Send to the PC** encrypts the characters you changed on the Switch and the PC
@@ -103,17 +102,17 @@ character on either side. A character you create on the Switch lands in the fold
 where the PC's other characters are; send only after receiving once, so the Switch
 knows where that is.
 
-**Privacy and the conversion service.** The encryption key is not public, so the
-app uses the free online service MCDSaveEdit uses (`https://dungeons.tools/`). The
-character JSON — game progress, nothing else — is sent to it over HTTPS each time
-you receive or send, and only after you allow it. Every encryption is decrypted
-again and must match before it is used. The Switch's date and time must be right
-for the secure connection to be accepted. Comparing sends nothing.
+**Conversion is offline.** The Windows game encrypts characters with AES-256 and a
+fixed key that the open-source MCDSaveEdit project publishes (`core/mcd_key.h`
+records where it comes from). The Switch does the encryption and decryption
+itself, so nothing is sent anywhere and no internet beyond your own network is
+needed. Every encryption is decrypted again and must match before it is used.
+The key belongs to the game's file format, not to this project; check that using
+it is acceptable to you.
 
-**Not verified:** the HTTPS connection on the console, and the real service, have
-not been run here. Everything else is tested end to end against the real PC
-daemon with a stand-in service speaking the same protocol. The first receive on
-your console is the real test: keep the backup it makes.
+**Not verified:** the conversion has not been run on a real console. It is
+tested against Go's AES, a real Windows character file, and the real PC daemon.
+The first receive on your console is the real test: keep the backup it makes.
 
 ## Safety, and its limits
 
@@ -164,7 +163,7 @@ Things to know:
 | Memory safety | All C tests run under AddressSanitizer and UBSan |
 | Interface | Every screen is rendered to an image by a PC test (under AddressSanitizer, so any drawing outside the screen fails it) and was looked at; frame cost is measured |
 | Title cache | Unit tests: round trip, replace, drop uninstalled games, damaged and wrong-version files |
-| Windows-save conversion | `e2e/mcd_test.go`: receive, send, new characters, untouched files staying byte-identical, service down, garbage from the service, send-before-receive — all against the real daemon with a stand-in service; the HTTP client's name lookup and TLS plumbing are unit-tested with a stand-in TLS. The console's TLS and the real service are **not** tested |
+| Windows-save conversion | `e2e/mcd_test.go`: receive, send, new characters, untouched files staying byte-identical, damaged characters, non-character files, send-before-receive — all against the real daemon, with Go's AES as the independent check. Real console behaviour is **not** tested |
 | Console layer | Type-checked against stand-in libnx headers (`make -f Makefile.host check-switch`) — which only checks this project's own code — and built with the real toolchain in CI. **Not run on hardware.** |
 
 ## Build and test
@@ -196,9 +195,7 @@ core/      portable C: crypto, JSON, HTTP, manifests, pairing state, client, ser
 ui/        portable renderer and screens (drawn into a pixel buffer; ASCII font generated from
            Liberation Sans, licence in FONT-LICENSE.txt)
 switch/    the console layer: save mounting and the game list (libnx), the input loop
-tools/     hostcli (terminal driver); Go helpers that produce the expected values for tests;
-           mcdsync (an optional PC-side converter for the same saves, if you would rather not
-           convert on the console)
+tools/     hostcli (terminal driver); Go helpers that produce the expected values for tests
 tests/     unit tests and the vectors they check against
 e2e/       Go end-to-end tests against a real daemon
 ```

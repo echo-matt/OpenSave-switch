@@ -37,7 +37,6 @@
 static const char *saves_dir = "saves";
 static const char *work_dir = "work";
 static int auto_approve = 0;
-static const char *service_url = OS_MCD_DEFAULT_SERVICE;
 static os_server server;
 static os_state st;
 static int paired_event, update_event;
@@ -166,7 +165,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--auto-approve")) auto_approve = 1;
-        else if (!strcmp(argv[i], "--service") && i + 1 < argc) service_url = argv[++i];
         else break;
     }
     if (i >= argc) {
@@ -333,7 +331,7 @@ int main(int argc, char **argv) {
         snprintf(backup, sizeof backup, "%s/backup/%s", work_dir, cmd[1]);
         memset(&pr, 0, sizeof pr);
         pr.progress = progress;
-        if (os_mcd_pull(&st, peer, l, service_url, root, convert, backup, &pr, &r, err, sizeof err) != 0) {
+        if (os_mcd_pull(&st, peer, l, root, convert, backup, &pr, &r, err, sizeof err) != 0) {
             printf("MCD-PULL FAIL %s\n", err);
             rc = 1;
         } else {
@@ -352,7 +350,7 @@ int main(int argc, char **argv) {
         if (!l) { printf("ERROR not linked\n"); return 1; }
         snprintf(root, sizeof root, "%s/%s", saves_dir, cmd[1]);
         snprintf(convert, sizeof convert, "%s/convert/%s", work_dir, cmd[1]);
-        if (os_mcd_prepare_send(service_url, root, convert, &prepared, err, sizeof err) != 0) {
+        if (os_mcd_prepare_send(root, convert, &prepared, err, sizeof err) != 0) {
             printf("MCD-SEND FAIL %s\n", err);
             rc = 1;
         } else if (os_peer_trigger_sync(&st, peer, l->game_id, err, sizeof err) != 0) {

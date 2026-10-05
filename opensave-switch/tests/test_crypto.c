@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "../core/aes.h"
 #include "../core/auth.h"
 #include "../core/crypto.h"
 #include "testutil.h"
@@ -44,6 +45,20 @@ static void test_fixed(void) {
         hexcheck(k1, 32, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
         CHECK(memcmp(k1, k2, 32) == 0);
     }
+}
+
+/* FIPS-197 appendix C.3: AES-256. */
+static void test_aes_fips(void) {
+    uint8_t key[32], pt[16], out[16], back[16];
+    int i;
+    os_aes256 a;
+    for (i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    for (i = 0; i < 16; i++) pt[i] = (uint8_t)(i * 0x11);
+    os_aes256_init(&a, key);
+    os_aes256_encrypt_block(&a, pt, out);
+    hexcheck(out, 16, "8ea2b7ca516745bfeafc49904b496089");
+    os_aes256_decrypt_block(&a, out, back);
+    CHECK(memcmp(back, pt, 16) == 0);
 }
 
 static void test_vectors(const char *path) {
@@ -134,6 +149,17 @@ static void test_vectors(const char *path) {
             t_unhex(pt, tok[2]);
             CHECK(os_x25519(out, sc, pt) == 0);
             hexcheck(out, 32, tok[3]);
+        } else if (!strcmp(tok[0], "aes256")) {
+            uint8_t key[32], pt[16], ct[16], got[16], back[16];
+            os_aes256 a;
+            t_unhex(key, tok[1]);
+            t_unhex(pt, tok[2]);
+            os_aes256_init(&a, key);
+            os_aes256_encrypt_block(&a, pt, got);
+            hexcheck(got, 16, tok[3]);
+            t_unhex(ct, tok[3]);
+            os_aes256_decrypt_block(&a, ct, back);
+            CHECK(memcmp(back, pt, 16) == 0);
         } else if (!strcmp(tok[0], "fingerprint")) {
             uint8_t a[32], b[32], c[32];
             char got[OS_FINGERPRINT_LEN], want[OS_FINGERPRINT_LEN], swapped[OS_FINGERPRINT_LEN];
@@ -171,6 +197,7 @@ static void test_b64_rejects(void) {
 
 int main(int argc, char **argv) {
     test_fixed();
+    test_aes_fips();
     test_b64_rejects();
     test_vectors(argc > 1 ? argv[1] : "tests/vectors.txt");
     return t_finish("crypto");

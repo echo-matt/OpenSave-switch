@@ -33,7 +33,6 @@
 #include "../core/title.h"
 #include "../ui/ui.h"
 #include "saves.h"
-#include "tls_switch.h"
 
 #define CONFIG_PATH "sdmc:/config/opensave/state.json"
 #define BACKUP_ROOT "sdmc:/switch/OpenSave/backups"
@@ -627,21 +626,6 @@ static void do_push(const char *game_id) {
 
 /* ------------------------------------------ Windows saves on the PC (linked) */
 
-static const char *service_url(void) { return g_st.convert_url[0] ? g_st.convert_url : OS_MCD_DEFAULT_SERVICE; }
-
-/* The first time anything would be sent to the conversion service, ask. */
-static int ensure_consent(draw_fn under, void *under_arg) {
-    char err[200];
-    if (g_st.convert_consent) return 1;
-    if (!confirm(under, under_arg, UI_WARN, "Convert with dungeons.tools?",
-                 "Windows saves are encrypted, so a free online service converts them. Your characters (game progress only) are sent to it over HTTPS whenever you receive or send.",
-                 NULL, "Allow", "Not now"))
-        return 0;
-    g_st.convert_consent = 1;
-    os_state_save(&g_st, err, sizeof err);
-    return 1;
-}
-
 static ui_games_t g_pickview;
 static void d_pick(gfx *g, void *a) {
     (void)a;
@@ -731,7 +715,7 @@ static void do_mcd_pull(const saves_title *t, const os_link *l, const char *name
     pr.progress = on_progress;
     pr.cancelled = on_cancel;
 
-    if (os_mcd_pull(&g_st, p, l, service_url(), SAVES_MOUNT_ROOT, cdir, backup, &pr, &res, err, sizeof err) != 0) {
+    if (os_mcd_pull(&g_st, p, l, SAVES_MOUNT_ROOT, cdir, backup, &pr, &res, err, sizeof err) != 0) {
         saves_unmount(); /* nothing was committed: the save is as it was */
         show_result(UI_ERR, "Nothing was changed", err);
         return;
@@ -760,7 +744,7 @@ static void do_mcd_send(const saves_title *t, const os_link *l) {
     int prepared = 0;
     convert_dir_for(t->tid, cdir, sizeof cdir);
     show_busy("Converting characters", "Encrypting this Switch's changes for the PC");
-    if (os_mcd_prepare_send(service_url(), SAVES_MOUNT_ROOT, cdir, &prepared, err, sizeof err) != 0) {
+    if (os_mcd_prepare_send(SAVES_MOUNT_ROOT, cdir, &prepared, err, sizeof err) != 0) {
         show_result(UI_ERR, "Could not prepare the characters", err);
         return;
     }
@@ -934,7 +918,7 @@ static void game_screen(const saves_title *t) {
                             "The current save is backed up on the SD card first, so you can put it back.", NULL, "Replace",
                             "Cancel")) {
                     if (lk) {
-                        if (ensure_consent(d_game, &gv)) do_mcd_pull(t, lk, name);
+                        do_mcd_pull(t, lk, name);
                     } else {
                         do_pull(t, game_id, name);
                     }
@@ -942,7 +926,7 @@ static void game_screen(const saves_title *t) {
                 break;
             case ACT_SEND:
                 if (lk) {
-                    if (ensure_consent(d_game, &gv)) do_mcd_send(t, lk);
+                    do_mcd_send(t, lk);
                 } else {
                     do_push(game_id);
                 }
@@ -1001,7 +985,6 @@ int main(void) {
         show_result(UI_ERR, "Could not start networking", "Check the Wi-Fi settings and start OpenSave again.");
         goto done;
     }
-    tls_switch_init(); /* optional: only the Windows-save conversion needs it */
     if (saves_init() != 0) {
         show_result(UI_ERR, "Could not start the game services", "OpenSave needs to run with full access (Atmosphere).");
         goto done;
@@ -1123,7 +1106,6 @@ int main(void) {
 done:
     os_server_stop(&g_srv);
     saves_exit();
-    tls_switch_exit();
     socketExit();
     free(g_titles);
     free(g_rows);

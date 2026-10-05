@@ -3,15 +3,11 @@ package switche2e
 import (
 	"bytes"
 	"crypto/aes"
-	"crypto/rand"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,30 +18,17 @@ const mcdTitle = "01006C100EC08000"
 
 var magicDat = []byte("D001\x00\x00\x00\x00")
 
-// convService stands in for dungeons.tools: the same protocol (POST
-// api/encryption/{decrypt,encrypt}, camelCase fields, base64 with no padding,
-// AES-256-ECB with zero padding, zeros stripped on decrypt) under a key made for
-// the test. The real key is not public and is not used.
-type convService struct {
-	srv      *httptest.Server
-	key      []byte
-	down     atomic.Bool
-	offsite  atomic.Int32 // requests that reached the service under a different host name
-	garbage  atomic.Bool
-	requests atomic.Int32
-}
+// mcdKey is the key the Windows game uses for its character files, as published
+// by MCDSaveEdit. The tests encrypt and decrypt with Go's own AES, so they check
+// the C implementation against an independent one.
+var mcdKey, _ = hex.DecodeString("5CEB9D0AEBB95AC0270B0AF6753DFC0EE3E68BB69479020F2430E2EA002BD4C9")
 
-func newConvService(t *testing.T) *convService {
-	t.Helper()
-	c := &convService{key: make([]byte, 32)}
-	rand.Read(c.key)
-	c.srv = httptest.NewServer(http.HandlerFunc(c.handle))
-	t.Cleanup(c.srv.Close)
-	return c
-}
+type convService struct{}
+
+func newConvService(t *testing.T) *convService { return &convService{} }
 
 func (c *convService) ecb(in []byte, enc bool) []byte {
-	b, _ := aes.NewCipher(c.key)
+	b, _ := aes.NewCipher(mcdKey)
 	if enc {
 		for len(in)%16 != 0 {
 			in = append(in, 0)
@@ -60,60 +43,6 @@ func (c *convService) ecb(in []byte, enc bool) []byte {
 		}
 	}
 	return out
-}
-
-func b64(b []byte) string { return strings.TrimRight(base64.StdEncoding.EncodeToString(b), "=") }
-func unb64(s string) []byte {
-	b, _ := base64.RawStdEncoding.DecodeString(strings.TrimRight(s, "="))
-	return b
-}
-
-func (c *convService) handle(w http.ResponseWriter, r *http.Request) {
-	c.requests.Add(1)
-	if strings.HasPrefix(r.Host, "localhost") {
-		c.offsite.Add(1)
-	}
-	// Redirect routes, to test how the client follows them: the real service
-	// answered the first call with HTTP 301.
-	redirect := func(prefix, loc string) bool {
-		if !strings.HasPrefix(r.URL.Path, prefix) {
-			return false
-		}
-		w.Header().Set("Location", loc+strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(prefix, "/")))
-		w.WriteHeader(301)
-		return true
-	}
-	switch {
-	case redirect("/old/", ""): // a path on the same host
-		return
-	case redirect("/abs/", c.srv.URL): // an absolute address on the same host
-		return
-	case redirect("/evil/", strings.Replace(c.srv.URL, "127.0.0.1", "localhost", 1)): // another host name
-		return
-	case strings.HasPrefix(r.URL.Path, "/loop/"):
-		w.Header().Set("Location", r.URL.Path)
-		w.WriteHeader(301)
-		return
-	}
-	if c.down.Load() {
-		http.Error(w, "down", 503)
-		return
-	}
-	var in map[string]string
-	json.NewDecoder(r.Body).Decode(&in)
-	switch r.URL.Path {
-	case "/api/encryption/decrypt":
-		plain := bytes.TrimRight(c.ecb(unb64(in["Encrypted"]), false), "\x00")
-		json.NewEncoder(w).Encode(map[string]any{"encrypted": nil, "decrypted": b64(plain)})
-	case "/api/encryption/encrypt":
-		enc := c.ecb(append([]byte{}, unb64(in["Decrypted"])...), true)
-		if c.garbage.Load() {
-			enc = bytes.Repeat([]byte{9}, 32)
-		}
-		json.NewEncoder(w).Encode(map[string]any{"encrypted": b64(enc), "decrypted": nil})
-	default:
-		http.NotFound(w, r)
-	}
 }
 
 func (c *convService) dat(plain []byte) []byte {
@@ -152,7 +81,7 @@ func (e *mcdEnv) readSw(name string) []byte {
 	return b
 }
 func (e *mcdEnv) run(timeout time.Duration, args ...string) string {
-	return e.sw.run(timeout, append([]string{"--service", e.svc.srv.URL + "/"}, args...)...)
+	return e.sw.run(timeout, args...)
 }
 
 // newMcdEnv: a PC tracking a Windows-style Minecraft Dungeons folder (nested,
@@ -258,7 +187,7 @@ func TestMcdSendEncryptsSwitchProgressIntoTheWindowsFolder(t *testing.T) {
 		t.Fatalf("the Switch's edits should show before sending:\n%s", out)
 	}
 
-	p := e.sw.start("--service", e.svc.srv.URL+"/", "mcd-send", mcdTitle, "25")
+	p := e.sw.start("mcd-send", mcdTitle, "25")
 	line := p.waitFor("MCD-SEND TRIGGERED", 60*time.Second)
 	if !strings.Contains(line, "prepared=2") {
 		t.Fatalf("expected two characters prepared: %s", line)
@@ -285,90 +214,29 @@ func TestMcdSendEncryptsSwitchProgressIntoTheWindowsFolder(t *testing.T) {
 
 func TestMcdFailuresLeaveEverythingAlone(t *testing.T) {
 	e := newMcdEnv(t)
-	e.sw.write("keep-me", "x") // (written under the Pokémon-style title dir; irrelevant to this one)
-	if err := os.WriteFile(e.swPath("CharacterOLD0000000000000"), character("OLD", 1), 0o666); err != nil {
-		t.Fatal(err)
+	// A damaged character on the PC is skipped; the good ones still convert.
+	e.pc.WriteSave(e.chars+"/"+guidN+".dat", "D001\x00\x00\x00\x00not a real save")
+	out := e.run(90*time.Second, "mcd-pull", mcdTitle, "3")
+	if !strings.Contains(out, "MCD-PULL OK") || !strings.Contains(out, "converted=2") || !strings.Contains(out, "skipped=2") {
+		t.Fatalf("a damaged character should be skipped, the rest converted: %s", out)
 	}
-	before := snapshot(t, filepath.Join(e.sw.saves, mcdTitle))
-
-	// The conversion service is down: nothing on the Switch changes.
-	e.svc.down.Store(true)
-	out := e.run(60*time.Second, "mcd-pull", mcdTitle, "1")
-	if !strings.Contains(out, "MCD-PULL FAIL") || !strings.Contains(out, "conversion service") {
-		t.Fatalf("a service outage should fail the receive and say why: %s", out)
+	if e.readSw("Character"+guidN) != nil {
+		t.Fatal("a damaged character reached the Switch")
 	}
-	if !sameSnapshot(before, snapshot(t, filepath.Join(e.sw.saves, mcdTitle))) {
-		t.Fatal("the Switch save changed although the service was down")
-	}
-	e.svc.down.Store(false)
-
-	// Receive for real, then break sending: garbage from the service must not
-	// reach the PC or the mirror.
-	if out := e.run(90*time.Second, "mcd-pull", mcdTitle, "3"); !strings.Contains(out, "MCD-PULL OK") {
-		t.Fatalf("receive: %s", out)
-	}
+	// A Switch file that is not a character is never encrypted or sent.
 	pcBefore := e.pcFile(e.chars + "/" + guidA + ".dat")
-	os.WriteFile(e.swPath("Character"+guidA), character(guidA, 999), 0o666)
-	e.svc.garbage.Store(true)
-	out = e.run(60*time.Second, "mcd-send", mcdTitle, "2")
-	if !strings.Contains(out, "MCD-SEND FAIL") {
-		t.Fatalf("an unverifiable encryption must fail the send: %s", out)
+	os.WriteFile(e.swPath("CharacterBROKEN0000000000000000000000"), []byte("not json"), 0o666)
+	out = e.run(30*time.Second, "mcd-send", mcdTitle, "2")
+	if strings.Contains(out, "MCD-SEND FAIL") == false && !bytes.Equal(e.pcFile(e.chars+"/"+guidA+".dat"), pcBefore) {
+		t.Fatalf("unrelated PC data changed: %s", out)
 	}
-	if !bytes.Equal(e.pcFile(e.chars+"/"+guidA+".dat"), pcBefore) {
-		t.Fatal("garbage was written into the PC's save")
+	if e.pcFile(e.chars+"/BROKEN0000000000000000000000.dat") != nil {
+		t.Fatal("a file that is not a character was sent to the PC")
 	}
-	e.svc.garbage.Store(false)
 
 	// Sending before anything was received is refused with an instruction.
 	e2 := newMcdEnv(t)
 	if out := e2.run(30*time.Second, "mcd-send", mcdTitle, "1"); !strings.Contains(out, "Receive from the PC first") {
 		t.Fatalf("send before receive: %s", out)
-	}
-}
-
-// TestMcdRedirects: the real service answered its first call with HTTP 301.
-// A redirect to the same site is followed (re-sending the body as a POST); one to
-// another site is refused without sending anything; a loop stops.
-func TestMcdRedirects(t *testing.T) {
-	e := newMcdEnv(t)
-	base := e.svc.srv.URL
-	pull := func(prefix string) string {
-		return e.sw.run(90*time.Second, "--service", base+prefix, "mcd-pull", mcdTitle, "2")
-	}
-	swBefore := snapshot(t, filepath.Join(e.sw.saves, mcdTitle))
-
-	// Another site: refused, and the target is named so the person can see it.
-	out := pull("/evil/")
-	if !strings.Contains(out, "MCD-PULL FAIL") || !strings.Contains(out, "redirected to http://localhost") || !strings.Contains(out, "not the same site") {
-		t.Fatalf("an off-site redirect should be refused and say where to: %s", out)
-	}
-	if n := e.svc.offsite.Load(); n != 0 {
-		t.Fatalf("%d requests (a save) were sent to the other site", n)
-	}
-	// A loop gives up.
-	if out := pull("/loop/"); !strings.Contains(out, "MCD-PULL FAIL") || !strings.Contains(out, "too many times") {
-		t.Fatalf("a redirect loop should stop: %s", out)
-	}
-	if !sameSnapshot(swBefore, snapshot(t, filepath.Join(e.sw.saves, mcdTitle))) {
-		t.Fatal("the Switch save changed although the service could not be used")
-	}
-
-	// The same site, by absolute address and by path: followed, and it works.
-	if out := pull("/abs/"); !strings.Contains(out, "MCD-PULL OK same=0 converted=2") {
-		t.Fatalf("an absolute same-site redirect should be followed: %s", out)
-	}
-	if !sameJ(e.readSw("Character"+guidA), character(guidA, 100)) {
-		t.Fatal("the redirected conversion gave the wrong character")
-	}
-	os.WriteFile(e.swPath("Character"+guidA), character(guidA, 321), 0o666)
-	p := e.sw.start("--service", base+"/old/", "mcd-send", mcdTitle, "20")
-	if line := p.waitFor("MCD-SEND TRIGGERED", 60*time.Second); !strings.Contains(line, "prepared=1") {
-		t.Fatalf("a relative same-site redirect should be followed when sending: %s", line)
-	}
-	if !testutil.WaitFor(40*time.Second, func() bool {
-		raw := e.pcFile(e.chars + "/" + guidA + ".dat")
-		return bytes.HasPrefix(raw, magicDat) && sameJ(e.svc.undat(raw), character(guidA, 321))
-	}) {
-		t.Fatal("the PC never received the character sent through a redirect")
 	}
 }

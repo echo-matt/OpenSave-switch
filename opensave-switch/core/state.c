@@ -176,8 +176,6 @@ int os_state_load(os_state *s, const char *path, char *err, size_t errlen) {
             return -1;
         }
     }
-    s->convert_consent = os_json_int(d, os_json_get(d, root, "convertConsent"), 0) != 0;
-    copy_str(s->convert_url, sizeof s->convert_url, os_json_get_str(d, root, "convertUrl"));
     for (it = os_json_first(d, os_json_get(d, root, "links")); it >= 0; it = os_json_next(d, it)) {
         const char *t = os_json_get_str(d, it, "title"), *g = os_json_get_str(d, it, "gameId");
         if (t && g && strlen(t) == 16) os_state_set_link(s, t, g, os_json_get_str(d, it, "name"));
@@ -241,8 +239,7 @@ int os_state_save(const os_state *s, char *err, size_t errlen) {
         os_sb_json_str(&sb, l->name);
         os_sb_putc(&sb, '}');
     }
-    os_sb_printf(&sb, "],\"convertConsent\":%d,\"convertUrl\":", s->convert_consent ? 1 : 0);
-    os_sb_json_str(&sb, s->convert_url);
+    os_sb_puts(&sb, "]");
     os_sb_putc(&sb, '}');
     text = os_sb_take(&sb, &n);
     if (!text) {
