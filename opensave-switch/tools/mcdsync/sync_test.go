@@ -434,3 +434,38 @@ func TestHTTPServiceSpeaksTheServicesProtocol(t *testing.T) {
 		t.Error("an unreadable reply was accepted")
 	}
 }
+
+func TestFindWindowsFolder(t *testing.T) {
+	root := t.TempDir()
+	if _, err := findWindowsFolder(filepath.Join(root, "missing")); err == nil {
+		t.Error("a missing folder was not reported")
+	}
+	if _, err := findWindowsFolder(root); err == nil {
+		t.Error("an empty tree should find nothing")
+	}
+	chars := filepath.Join(root, "Saves", "abc", "Characters")
+	os.MkdirAll(chars, 0o777)
+	os.WriteFile(filepath.Join(chars, "plain.dat"), []byte("not encrypted"), 0o666) // no header: ignored
+	if _, err := findWindowsFolder(root); err == nil {
+		t.Error("a .dat without the header should not count")
+	}
+	os.WriteFile(filepath.Join(chars, guid+".dat"), append(append([]byte{}, magic...), make([]byte, 32)...), 0o666)
+	got, err := findWindowsFolder(root)
+	if err != nil || got != chars {
+		t.Fatalf("got %q, %v; want %q", got, err, chars)
+	}
+	// Two places: refuse to guess which is meant.
+	other := filepath.Join(root, "Saves", "def", "Characters")
+	os.MkdirAll(other, 0o777)
+	os.WriteFile(filepath.Join(other, "AAAA.dat"), append(append([]byte{}, magic...), make([]byte, 32)...), 0o666)
+	if _, err := findWindowsFolder(root); err == nil || !strings.Contains(err.Error(), "several") {
+		t.Errorf("two candidate folders must not be guessed between: %v", err)
+	}
+	// Our own backup folder is never mistaken for the saves.
+	os.RemoveAll(other)
+	os.MkdirAll(filepath.Join(root, backupName), 0o777)
+	os.WriteFile(filepath.Join(root, backupName, "x.dat"), append(append([]byte{}, magic...), make([]byte, 32)...), 0o666)
+	if got, err := findWindowsFolder(root); err != nil || got != chars {
+		t.Errorf("the backup folder confused detection: %q %v", got, err)
+	}
+}

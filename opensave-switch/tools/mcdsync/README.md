@@ -16,20 +16,36 @@ HTTPS whenever a file changes.** You must pass `-yes` to agree.
 ## Run
 
 ```sh
-mcdsync -yes \
-  -windows "%LOCALAPPDATA%\Dungeons\Saved\...\<folder holding the .dat files>" \
-  -switch  "<the folder OpenSave syncs to the Switch>"
+mcdsync -yes -switch "<the folder OpenSave syncs to the Switch>"
 ```
 
-`-windows` is the folder that directly holds the `.dat` character files. `-switch`
+`-windows` defaults to `auto`: it finds the one folder under
+`%LOCALAPPDATA%\Dungeons\Saved` that holds encrypted character files, and asks you to
+pass the folder yourself if there are several. (`-windows` is the folder that
+directly holds the `.dat` files.) `-switch`
 is a folder laid out the way an emulator keeps a Switch save, which is how
 OpenSave recognises it:
 `…/nand/user/save/0000000000000000/<32 hex digits>/01006C100EC08000`
 (create the folders, and track that last one in OpenSave). On the Switch app, the
 game then shows **Receive from the PC**.
 
-It checks every 10 seconds (`-interval 0` runs once). It matches files by id:
+It checks every 5 seconds (`-interval 0` runs once). It matches files by id:
 `<id>.dat` ⇄ `Character<id>`.
+
+## Make it automatic
+
+Leave it running and the sync needs no steps of its own: a Windows save you finish
+playing becomes a Switch file within about 8 seconds (the check interval plus the
+3-second settle), which OpenSave then carries to the console, so **Receive** on the
+Switch already finds the converted file. A save you **Send** from the Switch lands
+in the folder on the PC and is encrypted into the Windows folder just as quickly.
+Wait a few seconds after finishing in one place before using the other.
+
+To start it with Windows (adjust the paths):
+
+```
+schtasks /Create /SC ONLOGON /TN mcdsync /TR "\"C:\tools\mcdsync.exe\" -yes -switch \"D:\switch-saves\...\01006C100EC08000\""
+```
 
 ## What it will and will not do
 

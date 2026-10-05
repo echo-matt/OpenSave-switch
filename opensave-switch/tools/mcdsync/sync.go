@@ -311,3 +311,52 @@ func (s *syncer) runOnce(ctx context.Context) error {
 	}
 	return nil
 }
+
+// findWindowsFolder looks under root for the one folder that holds encrypted
+// character files (".dat" files starting with the D001 header), so nobody has to
+// work out where the game keeps them. It refuses to guess between several.
+func findWindowsFolder(root string) (string, error) {
+	found := map[string]bool{}
+	const maxDepth = 5
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range ents {
+			full := filepath.Join(dir, e.Name())
+			switch {
+			case e.IsDir() && depth < maxDepth && !strings.HasPrefix(e.Name(), "."):
+				walk(full, depth+1)
+			case !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".dat"):
+				if f, err := os.Open(full); err == nil {
+					head := make([]byte, len(magic)+1)
+					n, _ := f.Read(head)
+					f.Close()
+					if n > len(magic) && isWindowsSave(head[:n]) {
+						found[dir] = true
+					}
+				}
+			}
+		}
+	}
+	if _, err := os.Stat(root); err != nil {
+		return "", fmt.Errorf("%s does not exist", root)
+	}
+	walk(root, 0)
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("no encrypted saves under %s", root)
+	case 1:
+		for d := range found {
+			return d, nil
+		}
+	}
+	dirs := make([]string, 0, len(found))
+	for d := range found {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	return "", fmt.Errorf("saves were found in several folders (%s)", strings.Join(dirs, ", "))
+}

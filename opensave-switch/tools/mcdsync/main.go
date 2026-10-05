@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 )
 
@@ -25,17 +26,27 @@ const notice = `mcdsync sends your character saves (the game progress JSON, noth
 the save files are sent, and only when one changes. Pass -yes to agree.`
 
 func main() {
-	win := flag.String("windows", "", "folder holding the Windows character .dat files")
+	win := flag.String("windows", "auto", `folder holding the Windows character .dat files, or "auto" to find it under %LOCALAPPDATA%\Dungeons\Saved`)
 	sw := flag.String("switch", "", "folder holding (or to hold) the Switch-format Character<id> files")
-	every := flag.Duration("interval", 10*time.Second, "how often to look for changes (0: once and exit)")
+	every := flag.Duration("interval", 5*time.Second, "how often to look for changes (0: once and exit)")
 	svcURL := flag.String("service", "https://dungeons.tools/", "encryption service")
 	yes := flag.Bool("yes", false, "agree to send saves to the service")
 	settle := flag.Duration("settle", 3*time.Second, "leave a file alone until it has been still this long")
 	flag.Parse()
 
-	if *win == "" || *sw == "" {
+	if *sw == "" {
 		flag.Usage()
 		os.Exit(2)
+	}
+	if *win == "auto" || *win == "" {
+		root := filepath.Join(os.Getenv("LOCALAPPDATA"), "Dungeons", "Saved")
+		dir, err := findWindowsFolder(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not find the Windows saves: %v\nPass -windows with the folder that holds the .dat files.\n", err)
+			os.Exit(2)
+		}
+		log.Printf("using the Windows saves in %s", dir)
+		*win = dir
 	}
 	if !*yes {
 		fmt.Fprintf(os.Stderr, notice+"\n", *svcURL)
