@@ -1,0 +1,58 @@
+name: Switch homebrew
+
+# The Nintendo Switch client (opensave-switch/). Its portable core is tested on
+# a PC against a real OpenSave daemon; the console build only compiles in the
+# devkitPro toolchain, which is why it has its own job in its own container.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "opensave-switch/**"
+      - ".github/workflows/opensave-switch.yml"
+      # The wire protocol the client has to keep speaking.
+      - "internal/p2p/**"
+      - "internal/e2ee/**"
+      - "internal/delta/**"
+  pull_request:
+    paths:
+      - "opensave-switch/**"
+      - ".github/workflows/opensave-switch.yml"
+      - "internal/p2p/**"
+      - "internal/e2ee/**"
+      - "internal/delta/**"
+
+jobs:
+  # The unit tests of the C core (crypto, JSON, HTTP, manifests — each checked
+  # against the Go implementation), then the end-to-end suite that pairs the C
+  # client with a real in-process daemon and moves saves both ways.
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit tests (AddressSanitizer + UBSan)
+        working-directory: opensave-switch
+        run: make -f Makefile.host test
+      - name: Frontend type-check against stand-in libnx headers
+        working-directory: opensave-switch
+        run: make -f Makefile.host check-switch
+      - name: End-to-end against the Go daemon
+        run: go test ./opensave-switch/e2e/... -count=1 -v
+
+  # The real console build. Without this the frontend would only ever be
+  # compiled by whoever has devkitPro installed.
+  nro:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build opensave-switch.nro
+        working-directory: opensave-switch
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opensave-switch-nro
+          path: opensave-switch/opensave-switch.nro
+          if-no-files-found: error

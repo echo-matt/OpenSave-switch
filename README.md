@@ -49,6 +49,7 @@ OpenSave gives **every** game the Steam Cloud experience:
 - **Smart conflict handling** — diverged saves are detected by **sync lineage**, not wall-clock timestamps. Keep yours, keep theirs, or keep both on a new branch.
 - **Cloud backup and hand-off** — optional mirroring to Google Drive, Dropbox, OneDrive, WebDAV, a webhook, or a local/NAS folder. Each device also reads the others' backups: a newer save that carries on from yours is brought over, and one that would replace progress made here is asked about first. Any OAuth provider can use your own app credentials instead of the built-in ones — required for OneDrive, and the fix for Google Drive's weekly re-login.
 - **Cross-device game matching** — the same title tracked under different names on two machines (a Steam install here, a differently-named folder there) can be matched by Steam App ID or linked by hand. App-ID matching is opt-in, so two separate copies of a game are never merged without asking.
+- **Nintendo Switch homebrew** — a native app for a Switch running custom firmware that pairs with OpenSave like any other device and moves a game's save between the console and your PC in either direction, with a verified backup first. See [opensave-switch](opensave-switch/README.md).
 - **A full command line** — `opensave` does everything the app does, for a Steam Deck in Game Mode or a headless server. See [Command line](#command-line).
 - **In-app updates** — one-click update from GitHub releases, pull a newer build straight from a paired device, or `opensave update` from the terminal.
 - **Privacy-first** — no accounts, no telemetry. As of v2.4.0, saves sent through the relay are encrypted end to end between your own two devices: the relay routes frames it cannot read and writes nothing to disk. You can self-host it so nobody else is on the path at all.
@@ -509,6 +510,7 @@ Issues and pull requests are welcome. Please run `go test ./... -timeout 2700s` 
 - [Getting Started](GETTING_STARTED.md) — start here if OpenSave is new to you. The whole thing from a fresh install, in plain language
 - [User Guide](USER_GUIDE.md) — the reference: every feature, what each setting does, troubleshooting
 - [Command line](docs/CLI.md) — the CLI end to end: the daemon model, which machine each command runs on, task-by-task sequences, scripting
+- [Nintendo Switch app](opensave-switch/README.md) — the homebrew client: requirements, pairing, what is and is not tested
 - [Running your own relay](docs/RELAY.md) — self-hosting, TLS, and the reverse-proxy settings WebSockets need
 - [Changelog](CHANGELOG.md) — release notes
 - [Privacy](PRIVACY.md) — what OpenSave does and doesn't do with your data

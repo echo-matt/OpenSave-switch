@@ -1,0 +1,47 @@
+# Host (PC) build of the portable core: the unit tests and the hostcli test
+# driver. The console build is the Makefile next to this one.
+#
+#   make -f Makefile.host test      run every test that needs no daemon
+#   make -f Makefile.host hostcli   build the driver the end-to-end tests use
+
+CC      ?= gcc
+SAN     ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined
+CFLAGS  ?= -std=gnu99 -Wall -Wextra -Wpedantic -Werror -O1 -g $(SAN)
+CORE    := core/crypto.c core/auth.c core/json.c core/http.c core/manifest.c core/fsutil.c \
+           core/state.c core/peer.c core/server.c core/sync.c core/title.c core/platform.c
+BUILD   := build
+
+.PHONY: test hostcli check-switch clean
+test: $(BUILD)/test_crypto $(BUILD)/test_json $(BUILD)/test_http $(BUILD)/test_title $(BUILD)/test_state
+	$(BUILD)/test_crypto tests/vectors.txt
+	$(BUILD)/test_json
+	$(BUILD)/test_http
+	$(BUILD)/test_title
+	$(BUILD)/test_state
+	bash tests/run_manifest_test.sh
+
+hostcli: $(BUILD)/hostcli
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/test_crypto: tests/test_crypto.c core/crypto.c core/auth.c tests/host_random.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+$(BUILD)/test_json: tests/test_json.c core/json.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+$(BUILD)/test_http: tests/test_http.c core/http.c | $(BUILD)
+	$(CC) $(CFLAGS) -pthread -o $@ $^
+$(BUILD)/test_title: tests/test_title.c core/title.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+$(BUILD)/test_state: tests/test_state.c core/state.c core/crypto.c core/auth.c core/json.c core/fsutil.c core/platform.c tests/host_random.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+$(BUILD)/hostcli: tools/hostcli.c $(filter-out core/platform.c,$(CORE)) core/platform.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+
+# Syntax- and type-checks the console frontend against stand-in libnx headers.
+# This is only a sanity check of this project's own code; see tests/stubs/switch.h.
+check-switch:
+	$(CC) -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fsyntax-only -D__SWITCH__ -Itests/stubs switch/main.c switch/saves.c switch/platform_switch.c
+
+clean:
+	rm -rf $(BUILD)
