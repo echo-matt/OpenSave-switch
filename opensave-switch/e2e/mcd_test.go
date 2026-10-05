@@ -199,6 +199,7 @@ func TestMcdSendEncryptsSwitchProgressIntoTheWindowsFolder(t *testing.T) {
 		t.Fatalf("the PC never received the Switch's progress\nswitch output:\n%s", p.output())
 	}
 	// A new character lands beside the others, encrypted and with the header.
+	testutil.WaitFor(40*time.Second, func() bool { return e.pcFile(e.chars+"/"+guidN+".dat") != nil })
 	newRaw := e.pcFile(e.chars + "/" + guidN + ".dat")
 	if newRaw == nil || !bytes.HasPrefix(newRaw, magicDat) || !sameJ(e.svc.undat(newRaw), character(guidN, 7)) {
 		t.Fatalf("the new character did not reach the PC's character folder")
