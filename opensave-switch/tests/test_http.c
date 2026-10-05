@@ -93,6 +93,27 @@ static int raw_exchange(const char **parts, int n, os_http_resp *resp, char *err
     return rc;
 }
 
+/* A stand-in "TLS" that passes bytes through and counts what happens, to prove
+ * the plumbing: sessions are opened for the right host, used, and closed. */
+static int tls_opens, tls_closes, tls_sends, tls_recvs;
+static char tls_host[64];
+static int tls_fail;
+static void *fake_open(int fd, const char *host, char *err, size_t errlen) {
+    int *p;
+    if (tls_fail) {
+        snprintf(err, errlen, "certificate not trusted");
+        return NULL;
+    }
+    tls_opens++;
+    snprintf(tls_host, sizeof tls_host, "%s", host);
+    p = malloc(sizeof *p);
+    *p = fd;
+    return p;
+}
+static int fake_send(void *t, const void *b, size_t n) { tls_sends++; return (int)send(*(int *)t, b, n, MSG_NOSIGNAL); }
+static int fake_recv(void *t, void *b, size_t n) { tls_recvs++; return (int)recv(*(int *)t, b, n, 0); }
+static void fake_close(void *t) { tls_closes++; free(t); }
+
 int main(void) {
     char err[128];
     os_http_resp r;
@@ -185,6 +206,35 @@ int main(void) {
         CHECK(os_http_request("127.0.0.1", port, "GET", "/ok", NULL, 0, NULL, 0, 1 << 20, 8000, &r, err,
                               sizeof err) == 0);
         os_http_resp_free(&r);
+    }
+
+    {   /* a host name is resolved, not only a dotted address */
+        CHECK(os_http_request("localhost", port, "GET", "/ok", NULL, 0, NULL, 0, 1 << 20, 4000, &r, err, sizeof err) == 0);
+        CHECK(r.status == 200);
+        os_http_resp_free(&r);
+        CHECK(os_http_request("no-such-host.invalid", port, "GET", "/", NULL, 0, NULL, 0, 1000, 3000, &r, err, sizeof err) == -1);
+        CHECK(strstr(err, "look up") != NULL);
+    }
+    {   /* https with no TLS in the build is an error that says so, not a plain-text request */
+        CHECK(os_http_request_tls("127.0.0.1", port, 1, "GET", "/ok", NULL, 0, NULL, 0, 1000, 2000, &r, err, sizeof err) == -1);
+        CHECK(strstr(err, "no TLS") != NULL);
+    }
+    {   /* with TLS supplied, a session is opened for the host name, used, and closed */
+        static const os_tls_hooks hooks = {fake_open, fake_send, fake_recv, fake_close};
+        os_http_set_tls(&hooks);
+        CHECK(os_http_request_tls("localhost", port, 1, "POST", "/x", NULL, 0, "{\"a\":1}", 7, 1 << 20, 4000, &r, err, sizeof err) == 0);
+        CHECK(r.status == 200);
+        CHECK(strstr(r.body, "POST|/x|") == r.body);
+        os_http_resp_free(&r);
+        CHECK(tls_opens == 1 && tls_closes == 1 && tls_sends >= 1 && tls_recvs >= 1);
+        CHECK_STR(tls_host, "localhost");
+        /* a handshake that fails is reported, and nothing is left open */
+        tls_fail = 1;
+        CHECK(os_http_request_tls("localhost", port, 1, "GET", "/", NULL, 0, NULL, 0, 1000, 2000, &r, err, sizeof err) == -1);
+        CHECK(strstr(err, "certificate") != NULL); /* the platform's reason reaches the caller */
+        CHECK(tls_opens == 1 && tls_closes == 1);  /* nothing opened, so nothing to close */
+        tls_fail = 0;
+        os_http_set_tls(NULL);
     }
 
     stop_server = 1;

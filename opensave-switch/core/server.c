@@ -241,6 +241,17 @@ static void route_approve_confirm(os_server *srv, const os_http_req *req, reply 
 static int resolve_game(os_server *srv, const char *game_id, char title[OS_TITLE_LEN], char *root, size_t rootlen,
                         reply *r) {
     char err[200] = "";
+    /* A game linked to a PC game is known by the PC's own id, which says nothing
+     * about a Switch title: look the link up first. */
+    os_link *link = os_state_find_link_by_game(srv->st, game_id);
+    if (link) {
+        snprintf(title, OS_TITLE_LEN, "%s", link->title);
+        if (!srv->hooks.open_linked || srv->hooks.open_linked(srv->hooks.ctx, link, root, rootlen, err, sizeof err) != 0) {
+            reply_error(r, 404, err[0] ? err : "Nothing has been received for this game yet.");
+            return -1;
+        }
+        return 0;
+    }
     if (!os_title_from_game_id(game_id, title)) {
         reply_error(r, 404, "Game not found.");
         return -1;

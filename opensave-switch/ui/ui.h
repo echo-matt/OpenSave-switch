@@ -65,6 +65,9 @@ typedef struct {
     const char *user; /* NULL when there is no account */
     int nusers;
     const char *status; /* e.g. "Reading games 12 / 80", or NULL */
+    const char *title;  /* the page title; NULL for "Games" */
+    const char *action; /* what A does ("Open", "Choose"); NULL for "Open" */
+    int picker;         /* a one-off choice: no rescan or user hints */
 } ui_games_t;
 int ui_games_visible(void);
 void ui_games(gfx *g, const ui_games_t *v);

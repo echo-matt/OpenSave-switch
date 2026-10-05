@@ -35,6 +35,27 @@ int os_http_request(const char *host, int port, const char *method, const char *
                     size_t max_body, int timeout_ms, os_http_resp *out, char *err,
                     size_t errlen);
 
+/* The same over TLS when tls is nonzero. host may be a name (resolved to IPv4),
+ * and it is what TLS checks the server's certificate against. The Host header
+ * carries the name alone; callers that use a non-default port are talking to
+ * OpenSave devices, which do not care. */
+int os_http_request_tls(const char *host, int port, int tls, const char *method, const char *target,
+                        const os_hdr *hdrs, int nhdrs, const void *body, size_t bodylen, size_t max_body,
+                        int timeout_ms, os_http_resp *out, char *err, size_t errlen);
+
+/* TLS is supplied by the platform (the console has a system service for it; a PC
+ * test can supply a stand-in). Without it, https requests fail with a clear error. */
+typedef struct {
+    /* Starts a session over an already-connected socket and completes the
+     * handshake, verifying the server's certificate for host. NULL on failure,
+     * with a reason in err. */
+    void *(*open)(int fd, const char *host, char *err, size_t errlen);
+    int (*send)(void *tls, const void *buf, size_t len); /* bytes sent, or < 0 */
+    int (*recv)(void *tls, void *buf, size_t len);       /* bytes, 0 at the end, < 0 on error */
+    void (*close)(void *tls);
+} os_tls_hooks;
+void os_http_set_tls(const os_tls_hooks *h);
+
 /* Parses an HTTP-date ("Mon, 02 Jan 2006 15:04:05 GMT") to unix seconds, or 0. */
 int64_t os_http_parse_date(const char *s);
 

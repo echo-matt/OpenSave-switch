@@ -24,6 +24,7 @@
 #include <switch.h>
 
 #include "../core/fsutil.h"
+#include "../core/mcd.h"
 #include "../core/peer.h"
 #include "../core/platform.h"
 #include "../core/server.h"
@@ -32,10 +33,12 @@
 #include "../core/title.h"
 #include "../ui/ui.h"
 #include "saves.h"
+#include "tls_switch.h"
 
 #define CONFIG_PATH "sdmc:/config/opensave/state.json"
 #define BACKUP_ROOT "sdmc:/switch/OpenSave/backups"
 #define STAGING_ROOT "sdmc:/switch/OpenSave/staging"
+#define CONVERT_ROOT "sdmc:/switch/OpenSave/convert"
 #define KEEP_BACKUPS 3
 #define APP_VERSION "OpenSave for Switch 0.2.0"
 
@@ -190,6 +193,20 @@ static int hook_open_save(void *ctx, const char *tid, char *root, size_t rootlen
     }
     snprintf(err, errlen, "This Switch has no save data for that game.");
     return -1;
+}
+
+/* Where the PC pulls a linked game from: the mirror of its own files plus this
+ * Switch's changes (see core/mcd.h), never the save itself. */
+static int hook_open_linked(void *ctx, const os_link *l, char *root, size_t rootlen, char *err, size_t errlen) {
+    char dir[300];
+    (void)ctx;
+    snprintf(dir, sizeof dir, "%s/%s", CONVERT_ROOT, l->title);
+    os_mcd_mirror_path(dir, root, rootlen);
+    if (!os_exists(root)) {
+        snprintf(err, errlen, "Nothing has been received for this game on the Switch yet.");
+        return -1;
+    }
+    return 0;
 }
 
 static void hook_pairing_request(void *ctx, const os_incoming *req) {
@@ -608,15 +625,161 @@ static void do_push(const char *game_id) {
                        : "Nothing was requested from this Switch yet. Check OpenSave on the PC.");
 }
 
+/* ------------------------------------------ Windows saves on the PC (linked) */
+
+static const char *service_url(void) { return g_st.convert_url[0] ? g_st.convert_url : OS_MCD_DEFAULT_SERVICE; }
+
+/* The first time anything would be sent to the conversion service, ask. */
+static int ensure_consent(draw_fn under, void *under_arg) {
+    char err[200];
+    if (g_st.convert_consent) return 1;
+    if (!confirm(under, under_arg, UI_WARN, "Convert with dungeons.tools?",
+                 "Windows saves are encrypted, so a free online service converts them. Your characters (game progress only) are sent to it over HTTPS whenever you receive or send.",
+                 NULL, "Allow", "Not now"))
+        return 0;
+    g_st.convert_consent = 1;
+    os_state_save(&g_st, err, sizeof err);
+    return 1;
+}
+
+static ui_games_t g_pickview;
+static void d_pick(gfx *g, void *a) {
+    (void)a;
+    ui_games(g, &g_pickview);
+}
+
+/* Lets the person choose which of the PC's games holds the Windows save. */
+static int pick_pc_game(char *game_id, size_t idn, char *name, size_t nn) {
+    os_remote_game *list = NULL;
+    int n = 0, sel = 0, top = 0, i, vis = ui_games_visible(), chosen = 0;
+    ui_game_row *rows;
+    char err[300];
+    os_peer *p = the_peer();
+
+    if (!p) return 0;
+    show_busy("Asking the PC", "Its list of games");
+    if (os_peer_list_games(&g_st, p, &list, &n, err, sizeof err) != 0) {
+        show_result(UI_ERR, "Could not get the PC's games", err);
+        return 0;
+    }
+    if (n == 0) {
+        free(list);
+        show_result(UI_INFO, "The PC tracks no games", "Track the game's Windows save folder in OpenSave on the PC, then try again.");
+        return 0;
+    }
+    rows = (ui_game_row *)calloc((size_t)n, sizeof *rows);
+    for (i = 0; rows && i < n; i++) {
+        rows[i].name = list[i].name[0] ? list[i].name : list[i].id;
+        rows[i].tid = list[i].id;
+        rows[i].kind = "PC game";
+    }
+    while (rows && appletMainLoop()) {
+        u64 down;
+        padUpdate(&g_pad);
+        down = padGetButtonsDown(&g_pad);
+        os_server_poll(&g_srv, 0);
+        if (down & HidNpadButton_B) break;
+        if ((down & HidNpadButton_Down) && sel + 1 < n) sel++;
+        if ((down & HidNpadButton_Up) && sel > 0) sel--;
+        if (sel < top) top = sel;
+        if (sel >= top + vis) top = sel - vis + 1;
+        if (down & HidNpadButton_A) {
+            snprintf(game_id, idn, "%s", list[sel].id);
+            snprintf(name, nn, "%s", rows[sel].name);
+            chosen = 1;
+            break;
+        }
+        memset(&g_pickview, 0, sizeof g_pickview);
+        g_pickview.rows = rows;
+        g_pickview.n = n;
+        g_pickview.sel = sel;
+        g_pickview.top = top;
+        g_pickview.title = "Choose the Windows save";
+        g_pickview.action = "Choose";
+        g_pickview.picker = 1;
+        frame(d_pick, NULL);
+    }
+    free(rows);
+    free(list);
+    return chosen;
+}
+
+static void convert_dir_for(const char *tid, char *out, size_t n) { snprintf(out, n, "%s/%s", CONVERT_ROOT, tid); }
+
+static void do_mcd_pull(const saves_title *t, const os_link *l, const char *name) {
+    char backup[400], cdir[300], err[400], stamp[32], head[300], msg[400];
+    os_mcd_result res;
+    os_progress pr;
+    time_t now = time(NULL);
+    struct tm tmv;
+    os_peer *p = the_peer();
+
+    if (!p) return;
+    gmtime_r(&now, &tmv);
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
+    snprintf(backup, sizeof backup, "%s/%s/%s", BACKUP_ROOT, t->tid, stamp);
+    convert_dir_for(t->tid, cdir, sizeof cdir);
+    snprintf(head, sizeof head, "Receiving %s", name);
+
+    g_prog.title = head;
+    g_prog.stage = "Asking the PC what it has";
+    g_prog.pct = -1;
+    g_last_pct = -2;
+    g_last_stage[0] = '\0';
+    frame(d_progress, &g_prog);
+    pr.ctx = NULL;
+    pr.progress = on_progress;
+    pr.cancelled = on_cancel;
+
+    if (os_mcd_pull(&g_st, p, l, service_url(), SAVES_MOUNT_ROOT, cdir, backup, &pr, &res, err, sizeof err) != 0) {
+        saves_unmount(); /* nothing was committed: the save is as it was */
+        show_result(UI_ERR, "Nothing was changed", err);
+        return;
+    }
+    if (res.already_same) {
+        show_result(UI_OK, "Already up to date", "This Switch already has the PC's characters.");
+        return;
+    }
+    if (saves_commit(err, sizeof err) != 0) {
+        saves_unmount();
+        show_result(UI_ERR, "The save was not kept", err);
+        return;
+    }
+    prune_backups(t->tid);
+    snprintf(msg, sizeof msg, "%d character%s converted and saved to this Switch.%s%s", res.converted,
+             res.converted == 1 ? "" : "s", res.backup_path[0] ? " The previous save is backed up on the SD card." : "",
+             res.skipped ? " Some encrypted files were not characters and were left alone." : "");
+    if (os_report_in_sync(&g_st, p, l->game_id, res.manifest_hash, err, sizeof err) == 0)
+        linger("Confirming with the PC", NULL, 4); /* the PC calls back to check */
+    show_result(UI_OK, "Saved to this Switch", msg);
+}
+
+/* Encrypts this Switch's changed characters for the PC, then asks it to take them. */
+static void do_mcd_send(const saves_title *t, const os_link *l) {
+    char cdir[300], err[300];
+    int prepared = 0;
+    convert_dir_for(t->tid, cdir, sizeof cdir);
+    show_busy("Converting characters", "Encrypting this Switch's changes for the PC");
+    if (os_mcd_prepare_send(service_url(), SAVES_MOUNT_ROOT, cdir, &prepared, err, sizeof err) != 0) {
+        show_result(UI_ERR, "Could not prepare the characters", err);
+        return;
+    }
+    if (prepared == 0) {
+        show_result(UI_INFO, "Nothing to send", "No character on this Switch has changed since it was last received.");
+        return;
+    }
+    do_push(l->game_id);
+}
+
 typedef struct {
     ui_game_t v;
     char status[80], detail[300];
-    const char *actions[4], *help[4];
-    int enabled[4];
+    const char *actions[6], *help[6];
+    int enabled[6];
 } game_t;
 static void d_game(gfx *g, void *a) { ui_game(g, &((game_t *)a)->v); }
 
-enum { ACT_RECEIVE, ACT_SEND, ACT_RESTORE, ACT_AGAIN, ACT_OFFER };
+enum { ACT_RECEIVE, ACT_SEND, ACT_RESTORE, ACT_AGAIN, ACT_OFFER, ACT_LINK, ACT_UNLINK };
 
 static void game_screen(const saves_title *t) {
     char err[300], game_id[128], name[128], path[160], backup[400];
@@ -624,7 +787,8 @@ static void game_screen(const saves_title *t) {
     os_remote_game rg;
     os_peer *p = the_peer();
     game_t gv;
-    int found = 0, refresh = 1, sel = 0, i, actions[4], nact;
+    int found = 0, refresh = 1, sel = 0, i, actions[6], nact;
+    os_link *lk = NULL;
 
     if (!p) return;
     memset(&gv, 0, sizeof gv);
@@ -639,17 +803,26 @@ static void game_screen(const saves_title *t) {
             os_game_id_for_title(game_id, sizeof game_id, t->tid);
             snprintf(name, sizeof name, "%s", t->name);
             os_save_path_for_title(path, sizeof path, t->tid);
-            if (os_peer_find_title(&g_st, p, t->tid, &rg, &found, err, sizeof err) != 0) {
-                show_result(UI_ERR, "Could not reach the PC", err);
-                return;
+            lk = os_state_find_link(&g_st, t->tid);
+            if (lk) {
+                char cdir[300];
+                /* A Windows save on the PC stands in for this game. */
+                snprintf(game_id, sizeof game_id, "%s", lk->game_id);
+                convert_dir_for(t->tid, cdir, sizeof cdir);
+                os_mcd_compare(&g_st, p, lk, SAVES_MOUNT_ROOT, cdir, &cmp);
+            } else {
+                if (os_peer_find_title(&g_st, p, t->tid, &rg, &found, err, sizeof err) != 0) {
+                    show_result(UI_ERR, "Could not reach the PC", err);
+                    return;
+                }
+                if (found == 2) {
+                    show_result(UI_WARN, "The PC tracks this game twice",
+                                "Link the right one in OpenSave on the PC (the game's Manage tab), then try again.");
+                    return;
+                }
+                if (found == 1) snprintf(game_id, sizeof game_id, "%s", rg.id); /* the PC's own id */
+                os_compare(&g_st, p, game_id, name, path, SAVES_MOUNT_ROOT, 0, &cmp);
             }
-            if (found == 2) {
-                show_result(UI_WARN, "The PC tracks this game twice",
-                            "Link the right one in OpenSave on the PC (the game's Manage tab), then try again.");
-                return;
-            }
-            if (found == 1) snprintf(game_id, sizeof game_id, "%s", rg.id); /* the PC's own id */
-            os_compare(&g_st, p, game_id, name, path, SAVES_MOUNT_ROOT, 0, &cmp);
             newest_backup(t->tid, backup, sizeof backup);
 
             memset(&gv, 0, sizeof gv);
@@ -680,6 +853,13 @@ static void game_screen(const saves_title *t) {
                 snprintf(gv.status, sizeof gv.status, "Could not compare");
                 snprintf(gv.detail, sizeof gv.detail, "%s", cmp.message);
             }
+            if (lk) { /* say what is being synced, and that it is converted */
+                if (cmp.state == OS_CMP_SAME) snprintf(gv.status, sizeof gv.status, "Up to date with the PC's Windows save");
+                if (cmp.state == OS_CMP_PC_LACKS) snprintf(gv.status, sizeof gv.status, "The linked PC game was not found");
+                if (cmp.state == OS_CMP_DIFFERENT) snprintf(gv.status, sizeof gv.status, "There are changes to move");
+                if (cmp.state != OS_CMP_PC_LACKS && cmp.state != OS_CMP_ERROR)
+                    snprintf(gv.detail, sizeof gv.detail, "Linked to \"%s\" on the PC. Converted automatically.", lk->name);
+            }
             gv.v.status = gv.status;
             if (gv.detail[0]) gv.v.detail = gv.detail;
             else if (cmp.remote_has_extra_roots) {
@@ -693,9 +873,13 @@ static void game_screen(const saves_title *t) {
                 actions[nact++] = ACT_RECEIVE;
                 actions[nact++] = ACT_SEND;
             }
-            if (cmp.state == OS_CMP_PC_LACKS) actions[nact++] = ACT_OFFER;
+            if (!lk && cmp.state == OS_CMP_PC_LACKS) {
+                if (os_mcd_supported(t->tid)) actions[nact++] = ACT_LINK;
+                actions[nact++] = ACT_OFFER;
+            }
             if (backup[0]) actions[nact++] = ACT_RESTORE;
-            actions[nact++] = ACT_AGAIN;
+            if (lk) actions[nact++] = ACT_UNLINK;
+            if (nact == 0) actions[nact++] = ACT_AGAIN;
             for (i = 0; i < nact; i++) {
                 gv.enabled[i] = 1;
                 switch (actions[i]) {
@@ -706,6 +890,14 @@ static void game_screen(const saves_title *t) {
                 case ACT_SEND:
                     gv.actions[i] = "Send to the PC";
                     gv.help[i] = "Ask the PC to take this Switch's save.";
+                    break;
+                case ACT_LINK:
+                    gv.actions[i] = "Use a Windows save from the PC";
+                    gv.help[i] = "Link this game to the Minecraft Dungeons save on your PC. Saves are converted automatically.";
+                    break;
+                case ACT_UNLINK:
+                    gv.actions[i] = "Stop using the Windows save";
+                    gv.help[i] = "Remove the link. Nothing is deleted.";
                     break;
                 case ACT_OFFER:
                     gv.actions[i] = "Offer to the PC";
@@ -732,6 +924,7 @@ static void game_screen(const saves_title *t) {
         os_server_poll(&g_srv, 0);
         d = padGetButtonsDown(&g_pad);
         if (d & HidNpadButton_B) return;
+        if (d & HidNpadButton_R) refresh = 1;
         if ((d & HidNpadButton_Down) && sel + 1 < gv.v.nactions) sel++;
         if ((d & HidNpadButton_Up) && sel > 0) sel--;
         if (d & HidNpadButton_A) {
@@ -739,10 +932,36 @@ static void game_screen(const saves_title *t) {
             case ACT_RECEIVE:
                 if (confirm(d_game, &gv, UI_WARN, "Replace this Switch's save?",
                             "The current save is backed up on the SD card first, so you can put it back.", NULL, "Replace",
-                            "Cancel"))
-                    do_pull(t, game_id, name);
+                            "Cancel")) {
+                    if (lk) {
+                        if (ensure_consent(d_game, &gv)) do_mcd_pull(t, lk, name);
+                    } else {
+                        do_pull(t, game_id, name);
+                    }
+                }
                 break;
-            case ACT_SEND: do_push(game_id); break;
+            case ACT_SEND:
+                if (lk) {
+                    if (ensure_consent(d_game, &gv)) do_mcd_send(t, lk);
+                } else {
+                    do_push(game_id);
+                }
+                break;
+            case ACT_LINK: {
+                char gid[128], gname[128];
+                if (pick_pc_game(gid, sizeof gid, gname, sizeof gname)) {
+                    if (!os_state_set_link(&g_st, t->tid, gid, gname)) show_result(UI_ERR, "Could not link", "Too many linked games.");
+                    else if (os_state_save(&g_st, err, sizeof err) != 0) show_result(UI_ERR, "Could not save the link", err);
+                }
+                break;
+            }
+            case ACT_UNLINK:
+                if (confirm(d_game, &gv, UI_WARN, "Stop using the Windows save?",
+                            "The link is removed. Saves on the Switch and the PC are not touched.", NULL, "Unlink", "Cancel")) {
+                    os_state_remove_link(&g_st, t->tid);
+                    os_state_save(&g_st, err, sizeof err);
+                }
+                break;
             case ACT_OFFER: {
                 os_cmp_result o;
                 show_busy("Offering to the PC", t->name);
@@ -782,6 +1001,7 @@ int main(void) {
         show_result(UI_ERR, "Could not start networking", "Check the Wi-Fi settings and start OpenSave again.");
         goto done;
     }
+    tls_switch_init(); /* optional: only the Windows-save conversion needs it */
     if (saves_init() != 0) {
         show_result(UI_ERR, "Could not start the game services", "OpenSave needs to run with full access (Atmosphere).");
         goto done;
@@ -800,6 +1020,7 @@ int main(void) {
     }
     memset(&hooks, 0, sizeof hooks);
     hooks.open_save = hook_open_save;
+    hooks.open_linked = hook_open_linked;
     hooks.on_pairing_request = hook_pairing_request;
     hooks.on_paired = hook_paired;
     hooks.on_unpaired = hook_unpaired;
@@ -902,6 +1123,7 @@ int main(void) {
 done:
     os_server_stop(&g_srv);
     saves_exit();
+    tls_switch_exit();
     socketExit();
     free(g_titles);
     free(g_rows);

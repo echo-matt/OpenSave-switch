@@ -14,7 +14,7 @@
  *             --auto-approve approve pairing requests received from a device
  *             --name NAME    device name
  *   commands: ping IP PORT | pair IP PORT [SECS] | serve SECS | compare TITLE | offer TITLE |
- *             pull TITLE [LINGER] | push TITLE [SECS] | restore TITLE | unpair | info
+ *             pull TITLE [LINGER] | push TITLE [SECS] | restore TITLE | games | link TITLE GAME [NAME] | mcd-compare|mcd-pull|mcd-send TITLE | unpair | info
  *
  * Output is line-oriented ("PAIRED ...", "PULL OK ...") for the tests to read.
  */
@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "../core/crypto.h"
+#include "../core/mcd.h"
 #include "../core/peer.h"
 #include "../core/platform.h"
 #include "../core/server.h"
@@ -36,6 +37,7 @@
 static const char *saves_dir = "saves";
 static const char *work_dir = "work";
 static int auto_approve = 0;
+static const char *service_url = OS_MCD_DEFAULT_SERVICE;
 static os_server server;
 static os_state st;
 static int paired_event, update_event;
@@ -54,6 +56,16 @@ static int open_save(void *ctx, const char *title, char *root, size_t rootlen, c
     (void)errlen;
     (void)err;
     snprintf(root, rootlen, "%s/%s", saves_dir, title);
+    return 0;
+}
+
+static int open_linked(void *ctx, const os_link *l, char *root, size_t rootlen, char *err, size_t errlen) {
+    char convert[400];
+    (void)ctx;
+    (void)err;
+    (void)errlen;
+    snprintf(convert, sizeof convert, "%s/convert/%s", work_dir, l->title);
+    os_mcd_mirror_path(convert, root, rootlen);
     return 0;
 }
 
@@ -154,6 +166,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--auto-approve")) auto_approve = 1;
+        else if (!strcmp(argv[i], "--service") && i + 1 < argc) service_url = argv[++i];
         else break;
     }
     if (i >= argc) {
@@ -169,6 +182,7 @@ int main(int argc, char **argv) {
     if (name) snprintf(st.device_name, sizeof st.device_name, "%s", name);
     memset(&hooks, 0, sizeof hooks);
     hooks.open_save = open_save;
+    hooks.open_linked = open_linked;
     hooks.on_pairing_request = on_pairing_request;
     hooks.on_paired = on_paired;
     hooks.on_unpaired = on_unpaired;
@@ -271,6 +285,81 @@ int main(int argc, char **argv) {
             rc = 1;
         } else {
             printf("PUSH TRIGGERED\n");
+            fflush(stdout);
+            serve_for(secs);
+        }
+    } else if (!strcmp(cmd[0], "games")) {
+        os_remote_game *list;
+        int n, k;
+        if (need_peer(&peer) != 0) return 1;
+        if (os_peer_list_games(&st, peer, &list, &n, err, sizeof err) != 0) {
+            printf("GAMES FAIL %s\n", err);
+            rc = 1;
+        } else {
+            for (k = 0; k < n; k++) printf("GAME id=%s name=\"%s\"\n", list[k].id, list[k].name);
+            free(list);
+        }
+    } else if (!strcmp(cmd[0], "link") && argc - i >= 3) {
+        if (!os_state_set_link(&st, cmd[1], cmd[2], argc - i >= 4 ? cmd[3] : cmd[2])) {
+            printf("LINK FAIL list full\n");
+            rc = 1;
+        } else {
+            os_state_save(&st, err, sizeof err);
+            printf("LINKED title=%s game=%s\n", cmd[1], cmd[2]);
+        }
+    } else if (!strcmp(cmd[0], "mcd-compare") && argc - i >= 2) {
+        char root[300], convert[400];
+        os_cmp_result r;
+        os_link *l;
+        if (need_peer(&peer) != 0) return 1;
+        l = os_state_find_link(&st, cmd[1]);
+        if (!l) { printf("ERROR not linked\n"); return 1; }
+        snprintf(root, sizeof root, "%s/%s", saves_dir, cmd[1]);
+        snprintf(convert, sizeof convert, "%s/convert/%s", work_dir, cmd[1]);
+        os_mcd_compare(&st, peer, l, root, convert, &r);
+        printf("MCD-COMPARE state=%d only_remote=%d only_local=%d differ=%d message=\"%s\"\n", (int)r.state, r.only_remote,
+               r.only_local, r.differ, r.message);
+    } else if (!strcmp(cmd[0], "mcd-pull") && argc - i >= 2) {
+        char root[300], convert[400], backup[400];
+        os_mcd_result r;
+        os_progress pr;
+        os_link *l;
+        int linger = argc - i >= 3 ? atoi(cmd[2]) : 4;
+        if (need_peer(&peer) != 0) return 1;
+        l = os_state_find_link(&st, cmd[1]);
+        if (!l) { printf("ERROR not linked\n"); return 1; }
+        snprintf(root, sizeof root, "%s/%s", saves_dir, cmd[1]);
+        snprintf(convert, sizeof convert, "%s/convert/%s", work_dir, cmd[1]);
+        snprintf(backup, sizeof backup, "%s/backup/%s", work_dir, cmd[1]);
+        memset(&pr, 0, sizeof pr);
+        pr.progress = progress;
+        if (os_mcd_pull(&st, peer, l, service_url, root, convert, backup, &pr, &r, err, sizeof err) != 0) {
+            printf("MCD-PULL FAIL %s\n", err);
+            rc = 1;
+        } else {
+            printf("MCD-PULL OK same=%d converted=%d skipped=%d files=%d backup=\"%s\"\n", r.already_same, r.converted,
+                   r.skipped, r.files, r.backup_path);
+            fflush(stdout);
+            if (!r.already_same) os_report_in_sync(&st, peer, l->game_id, r.manifest_hash, err, sizeof err);
+            serve_for(linger);
+        }
+    } else if (!strcmp(cmd[0], "mcd-send") && argc - i >= 2) {
+        char root[300], convert[400];
+        int prepared = 0, secs = argc - i >= 3 ? atoi(cmd[2]) : 8;
+        os_link *l;
+        if (need_peer(&peer) != 0) return 1;
+        l = os_state_find_link(&st, cmd[1]);
+        if (!l) { printf("ERROR not linked\n"); return 1; }
+        snprintf(root, sizeof root, "%s/%s", saves_dir, cmd[1]);
+        snprintf(convert, sizeof convert, "%s/convert/%s", work_dir, cmd[1]);
+        if (os_mcd_prepare_send(service_url, root, convert, &prepared, err, sizeof err) != 0) {
+            printf("MCD-SEND FAIL %s\n", err);
+            rc = 1;
+        } else if (os_peer_trigger_sync(&st, peer, l->game_id, err, sizeof err) != 0) {
+            printf("MCD-SEND FAIL %s\n", err);
+            rc = 1;
+        } else {
+            printf("MCD-SEND TRIGGERED prepared=%d\n", prepared);
             fflush(stdout);
             serve_for(secs);
         }

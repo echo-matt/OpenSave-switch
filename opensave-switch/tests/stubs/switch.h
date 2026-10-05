@@ -97,4 +97,25 @@ int fsdevMountDevice(const char *name, FsFileSystem fs);
 int fsdevUnmountDevice(const char *name);
 Result fsdevCommitDevice(const char *name);
 
+/* ssl */
+typedef struct { void *p; } SslContext;
+typedef struct { void *p; } SslConnection;
+#define SslVersion_Auto 0
+#define SslVerifyOption_PeerCa 1
+#define SslVerifyOption_HostName 2
+#define SslIoMode_Blocking 0
+Result sslInitialize(u32 num_sessions);
+void sslExit(void);
+Result sslCreateContext(SslContext *c, int version);
+void sslContextClose(SslContext *c);
+Result sslContextCreateConnection(SslContext *c, SslConnection *out);
+Result sslConnectionSetSocketDescriptor(SslConnection *c, int fd);
+Result sslConnectionSetHostName(SslConnection *c, const char *name, u32 len);
+Result sslConnectionSetVerifyOption(SslConnection *c, int opt);
+Result sslConnectionSetIoMode(SslConnection *c, int mode);
+Result sslConnectionDoHandshake(SslConnection *c, u32 *out_size, u32 *total_certs, void *buf, u32 bufsize);
+Result sslConnectionRead(SslConnection *c, void *buf, size_t size, s32 *out);
+Result sslConnectionWrite(SslConnection *c, const void *buf, size_t size, s32 *out);
+void sslConnectionClose(SslConnection *c);
+
 #endif

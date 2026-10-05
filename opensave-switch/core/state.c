@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "auth.h"
 #include "fsutil.h"
@@ -67,6 +68,39 @@ int os_state_remove_peer(os_state *s, const char *id) {
     if (!p) return 0;
     memset(p, 0, sizeof *p);
     return 1;
+}
+
+os_link *os_state_find_link(os_state *s, const char *title) {
+    int i;
+    for (i = 0; title && i < OS_MAX_LINKS; i++)
+        if (s->links[i].in_use && strcasecmp(s->links[i].title, title) == 0) return &s->links[i];
+    return NULL;
+}
+
+os_link *os_state_find_link_by_game(os_state *s, const char *game_id) {
+    int i;
+    for (i = 0; game_id && i < OS_MAX_LINKS; i++)
+        if (s->links[i].in_use && strcmp(s->links[i].game_id, game_id) == 0) return &s->links[i];
+    return NULL;
+}
+
+os_link *os_state_set_link(os_state *s, const char *title, const char *game_id, const char *name) {
+    os_link *l = os_state_find_link(s, title);
+    int i;
+    for (i = 0; !l && i < OS_MAX_LINKS; i++)
+        if (!s->links[i].in_use) l = &s->links[i];
+    if (!l) return NULL;
+    memset(l, 0, sizeof *l);
+    snprintf(l->title, sizeof l->title, "%s", title);
+    snprintf(l->game_id, sizeof l->game_id, "%s", game_id);
+    snprintf(l->name, sizeof l->name, "%s", name ? name : "");
+    l->in_use = 1;
+    return l;
+}
+
+void os_state_remove_link(os_state *s, const char *title) {
+    os_link *l = os_state_find_link(s, title);
+    if (l) memset(l, 0, sizeof *l);
 }
 
 int os_state_remember_nonce(os_state *s, const char *nonce, int64_t now_ms) {
@@ -142,6 +176,12 @@ int os_state_load(os_state *s, const char *path, char *err, size_t errlen) {
             return -1;
         }
     }
+    s->convert_consent = os_json_int(d, os_json_get(d, root, "convertConsent"), 0) != 0;
+    copy_str(s->convert_url, sizeof s->convert_url, os_json_get_str(d, root, "convertUrl"));
+    for (it = os_json_first(d, os_json_get(d, root, "links")); it >= 0; it = os_json_next(d, it)) {
+        const char *t = os_json_get_str(d, it, "title"), *g = os_json_get_str(d, it, "gameId");
+        if (t && g && strlen(t) == 16) os_state_set_link(s, t, g, os_json_get_str(d, it, "name"));
+    }
     peers = os_json_get(d, root, "peers");
     for (it = os_json_first(d, peers); it >= 0; it = os_json_next(d, it)) {
         uint8_t pub[32];
@@ -186,7 +226,24 @@ int os_state_save(const os_state *s, char *err, size_t errlen) {
         os_b64_encode(b64, p->pubkey, 32);
         os_sb_printf(&sb, ",\"port\":%d,\"publicKey\":\"%s\"}", p->port, b64);
     }
-    os_sb_puts(&sb, "]}");
+    os_sb_puts(&sb, "],\"links\":[");
+    first = 1;
+    for (i = 0; i < OS_MAX_LINKS; i++) {
+        const os_link *l = &s->links[i];
+        if (!l->in_use) continue;
+        if (!first) os_sb_putc(&sb, ',');
+        first = 0;
+        os_sb_puts(&sb, "{\"title\":");
+        os_sb_json_str(&sb, l->title);
+        os_sb_puts(&sb, ",\"gameId\":");
+        os_sb_json_str(&sb, l->game_id);
+        os_sb_puts(&sb, ",\"name\":");
+        os_sb_json_str(&sb, l->name);
+        os_sb_putc(&sb, '}');
+    }
+    os_sb_printf(&sb, "],\"convertConsent\":%d,\"convertUrl\":", s->convert_consent ? 1 : 0);
+    os_sb_json_str(&sb, s->convert_url);
+    os_sb_putc(&sb, '}');
     text = os_sb_take(&sb, &n);
     if (!text) {
         seterr(err, errlen, "out of memory");

@@ -139,6 +139,49 @@ int main(int argc, char **argv) {
     ui_game(&g, &game);
     save(dir, "game_missing");
 
+    {   /* picking the PC game that holds a Windows save */
+        ui_game_row prow[3] = {{"Minecraft Dungeons (Saved)", "minecraft-dungeons-saved", "PC game"},
+                               {"Stardew Valley", "stardew-valley", "PC game"},
+                               {"Hades", "hades", "PC game"}};
+        ui_games_t pv;
+        memset(&pv, 0, sizeof pv);
+        pv.rows = prow;
+        pv.n = 3;
+        pv.sel = 0;
+        pv.title = "Choose the Windows save";
+        pv.action = "Choose";
+        pv.picker = 1;
+        ui_games(&g, &pv);
+        save(dir, "picker");
+    }
+    {   /* a game linked to a Windows save */
+        static const char *const lacts[] = {"Receive from the PC", "Send to the PC", "Restore the last backup", "Stop using the Windows save"};
+        static const char *const lhelp[] = {"Replace this Switch's save with the PC's. The current one is backed up first.",
+                                            "Ask the PC to take this Switch's save.", "Put back the save from before the last receive.",
+                                            "Remove the link. Nothing is deleted."};
+        static const int len[] = {1, 1, 1, 1};
+        ui_game_t lg;
+        memset(&lg, 0, sizeof lg);
+        lg.title = "Minecraft Dungeons";
+        lg.tid = "01006C100EC08000";
+        lg.peer_name = "Matt's PC";
+        lg.status_kind = UI_WARN;
+        lg.status = "There are changes to move";
+        lg.detail = "Linked to \"Minecraft Dungeons (Saved)\" on the PC. Converted automatically.";
+        lg.only_pc = 1;
+        lg.only_here = 1;
+        lg.changed = 0;
+        lg.actions = lacts;
+        lg.action_help = lhelp;
+        lg.action_enabled = len;
+        lg.nactions = 4;
+        ui_game(&g, &lg);
+        save(dir, "game_linked");
+        ui_game(&g, &lg);
+        ui_dialog(&g, UI_WARN, "Convert with dungeons.tools?", "Windows saves are encrypted, so a free online service converts them. Your characters (game progress only) are sent to it over HTTPS whenever you receive or send.", NULL, "Allow", "Not now");
+        save(dir, "dialog_consent");
+    }
+
     ui_progress(&g, "Receiving The Legend of Zelda: Tears of the Kingdom", "slot/autosave_0.sav", 63, 0);
     save(dir, "progress");
     ui_progress(&g, "Receiving Game", "Asking the PC what it has", -1, 20);

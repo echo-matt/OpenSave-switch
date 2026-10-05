@@ -69,6 +69,15 @@ typedef struct {
 int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *save_root, const char *backup_dir,
             const char *staging_dir, const os_progress *pr, os_pull_result *res, char *err, size_t errlen);
 
+/* Downloads the listed files of a remote manifest into staging_dir (keeping their
+ * relative paths), checking every block and every whole file against the hashes
+ * in the manifest. idx lists indices into remote->files. total is the byte
+ * count for progress, *done accumulates. Nothing outside staging_dir is touched.
+ * Returns 0 on success. */
+int os_fetch_files(os_state *s, const os_peer *p, const char *game_id, const os_manifest *remote, const int *idx,
+                   int n, const char *staging_dir, const os_progress *pr, int64_t total, int64_t *done, char *err,
+                   size_t errlen);
+
 /* Puts a backup made by os_pull back: the save in save_root becomes exactly
  * what the backup holds. Returns 0 on success. The backup is verified against
  * the result and kept. */

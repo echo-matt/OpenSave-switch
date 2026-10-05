@@ -162,6 +162,15 @@ static int fetch_file(os_state *s, const os_peer *p, const char *game_id, const 
     return 0;
 }
 
+int os_fetch_files(os_state *s, const os_peer *p, const char *game_id, const os_manifest *remote, const int *idx,
+                   int n, const char *staging_dir, const os_progress *pr, int64_t total, int64_t *done, char *err,
+                   size_t errlen) {
+    int i;
+    for (i = 0; i < n; i++)
+        if (fetch_file(s, p, game_id, &remote->files[idx[i]], staging_dir, pr, done, total, err, errlen) != 0) return -1;
+    return 0;
+}
+
 int os_pull(os_state *s, const os_peer *p, const char *game_id, const char *save_root, const char *backup_dir,
             const char *staging_dir, const os_progress *pr, os_pull_result *res, char *err, size_t errlen) {
     os_remote_manifest rm;

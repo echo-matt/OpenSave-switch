@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +88,24 @@ static int wait_fd(int fd, int for_write, int timeout_ms) {
     return select(fd + 1, for_write ? NULL : &set, for_write ? &set : NULL, NULL, &tv);
 }
 
+/* A connection: a socket, and a TLS session over it when there is one. */
+typedef struct {
+    int fd;
+    void *tls;
+} conn;
+
+static os_tls_hooks g_tls;
+static int g_have_tls;
+
+void os_http_set_tls(const os_tls_hooks *h) {
+    if (h) {
+        g_tls = *h;
+        g_have_tls = 1;
+    } else {
+        g_have_tls = 0;
+    }
+}
+
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     while (len) {
@@ -109,8 +128,17 @@ static int connect_to(const char *host, int port, int timeout_ms, char *err, siz
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        seterr(err, errlen, "not an IPv4 address");
-        return -1;
+        /* Not a dotted address: a name, which needs resolving (IPv4 only). */
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+            seterr(err, errlen, "could not look up that name (is the network up?)");
+            return -1;
+        }
+        sa.sin_addr = ((struct sockaddr_in *)(void *)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
     }
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -203,11 +231,11 @@ static int header_in(const char *block, const char *name, char *out, size_t outl
 
 /* Reads from fd into b until `done` says the message is complete or the peer
  * closes. Returns 0 on EOF/complete, -1 on error or oversize. */
-static int recv_more(int fd, buf *b, size_t max) {
+static int recv_more(conn *c, buf *b, size_t max) {
     char tmp[8192];
-    ssize_t n = recv(fd, tmp, sizeof tmp, 0);
+    ssize_t n = c->tls ? (ssize_t)g_tls.recv(c->tls, tmp, sizeof tmp) : recv(c->fd, tmp, sizeof tmp, 0);
     if (n < 0) {
-        if (errno == EINTR) return 1;
+        if (!c->tls && errno == EINTR) return 1;
         return -1;
     }
     if (n == 0) return 0;
@@ -243,7 +271,32 @@ int os_http_request(const char *host, int port, const char *method, const char *
                     const os_hdr *hdrs, int nhdrs, const void *body, size_t bodylen,
                     size_t max_body, int timeout_ms, os_http_resp *out, char *err,
                     size_t errlen) {
+    return os_http_request_tls(host, port, 0, method, target, hdrs, nhdrs, body, bodylen, max_body, timeout_ms, out,
+                               err, errlen);
+}
+
+static void conn_close(conn *c) {
+    if (c->tls) g_tls.close(c->tls);
+    close(c->fd);
+}
+
+static int conn_send(conn *c, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    if (!c->tls) return send_all(c->fd, buf, len);
+    while (len) {
+        int n = g_tls.send(c->tls, p, len);
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+int os_http_request_tls(const char *host, int port, int tls, const char *method, const char *target,
+                        const os_hdr *hdrs, int nhdrs, const void *body, size_t bodylen, size_t max_body,
+                        int timeout_ms, os_http_resp *out, char *err, size_t errlen) {
     int fd, i, rc;
+    conn cc;
     char head[4096];
     int hn;
     buf in = {0, 0, 0};
@@ -255,24 +308,39 @@ int os_http_request(const char *host, int port, const char *method, const char *
     int chunked = 0;
 
     memset(out, 0, sizeof *out);
+    if (tls && !g_have_tls) {
+        seterr(err, errlen, "this build has no TLS, so it cannot reach an https address");
+        return -1;
+    }
     fd = connect_to(host, port, timeout_ms, err, errlen);
     if (fd < 0) return -1;
+    cc.fd = fd;
+    cc.tls = NULL;
+    if (tls) {
+        char terr2[120] = "";
+        cc.tls = g_tls.open(fd, host, terr2, sizeof terr2);
+        if (!cc.tls) {
+            conn_close(&cc);
+            seterr(err, errlen, terr2[0] ? terr2 : "the secure connection could not be set up");
+            return -1;
+        }
+    }
 
-    hn = snprintf(head, sizeof head, "%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n",
-                  method, target, host, port);
+    hn = snprintf(head, sizeof head, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n",
+                  method, target, host);
     for (i = 0; i < nhdrs && hn > 0 && (size_t)hn < sizeof head; i++)
         hn += snprintf(head + hn, sizeof head - (size_t)hn, "%s: %s\r\n", hdrs[i].name, hdrs[i].value);
     if (body || strcmp(method, "POST") == 0)
         hn += snprintf(head + hn, sizeof head - (size_t)hn,
                        "Content-Type: application/json\r\nContent-Length: %zu\r\n", bodylen);
     if (hn <= 0 || (size_t)hn + 2 >= sizeof head) {
-        close(fd);
+        conn_close(&cc);
         seterr(err, errlen, "request headers too large");
         return -1;
     }
     hn += snprintf(head + hn, sizeof head - (size_t)hn, "\r\n");
-    if (send_all(fd, head, (size_t)hn) != 0 || (bodylen && send_all(fd, body, bodylen) != 0)) {
-        close(fd);
+    if (conn_send(&cc, head, (size_t)hn) != 0 || (bodylen && conn_send(&cc, body, bodylen) != 0)) {
+        conn_close(&cc);
         seterr(err, errlen, "connection lost while sending");
         return -1;
     }
@@ -281,9 +349,9 @@ int os_http_request(const char *host, int port, const char *method, const char *
     for (;;) {
         hend = find_crlfcrlf(in.d ? in.d : "", in.len);
         if (hend) break;
-        rc = recv_more(fd, &in, OS_HTTP_MAX_HEADER);
+        rc = recv_more(&cc, &in, OS_HTTP_MAX_HEADER);
         if (rc <= 0) {
-            close(fd);
+            conn_close(&cc);
             free(in.d);
             seterr(err, errlen, rc == 0 ? "connection closed before a reply" : "no reply (timed out)");
             return -1;
@@ -291,7 +359,7 @@ int os_http_request(const char *host, int port, const char *method, const char *
     }
     *hend = '\0'; /* terminate the header block */
     if (sscanf(in.d, "HTTP/%*d.%*d %d", &out->status) != 1) {
-        close(fd);
+        conn_close(&cc);
         free(in.d);
         seterr(err, errlen, "malformed reply");
         return -1;
@@ -304,7 +372,7 @@ int os_http_request(const char *host, int port, const char *method, const char *
         char *e;
         want = strtol(clen, &e, 10);
         if (*e || want < 0 || (size_t)want > max_body) {
-            close(fd);
+            conn_close(&cc);
             free(in.d);
             seterr(err, errlen, "reply body too large");
             return -1;
@@ -322,25 +390,25 @@ int os_http_request(const char *host, int port, const char *method, const char *
                 /* Try decoding what is here; -2 means wait for more. */
                 char *tmp = (char *)malloc(have + 1);
                 long r;
-                if (!tmp) { close(fd); free(in.d); seterr(err, errlen, "out of memory"); return -1; }
+                if (!tmp) { conn_close(&cc); free(in.d); seterr(err, errlen, "out of memory"); return -1; }
                 r = dechunk(in.d + off, have, tmp);
                 if (r >= 0) {
                     out->body = tmp;
                     out->bodylen = (size_t)r;
                     out->body[r] = '\0';
-                    close(fd);
+                    conn_close(&cc);
                     free(in.d);
                     return 0;
                 }
                 free(tmp);
-                if (r == -1) { close(fd); free(in.d); seterr(err, errlen, "malformed chunked reply"); return -1; }
+                if (r == -1) { conn_close(&cc); free(in.d); seterr(err, errlen, "malformed chunked reply"); return -1; }
             }
-            rc = recv_more(fd, &in, max_total);
-            if (rc < 0) { close(fd); free(in.d); seterr(err, errlen, "reply too large or interrupted"); return -1; }
+            rc = recv_more(&cc, &in, max_total);
+            if (rc < 0) { conn_close(&cc); free(in.d); seterr(err, errlen, "reply too large or interrupted"); return -1; }
             if (rc == 0) {
                 if (chunked || want >= 0) {
                     /* Ended early: a truncated body must not be taken for a whole one. */
-                    close(fd);
+                    conn_close(&cc);
                     free(in.d);
                     seterr(err, errlen, "connection closed mid-reply");
                     return -1;
@@ -352,13 +420,13 @@ int os_http_request(const char *host, int port, const char *method, const char *
             size_t have = in.len - off;
             size_t n = (want >= 0) ? (size_t)want : have;
             out->body = (char *)malloc(n + 1);
-            if (!out->body) { close(fd); free(in.d); seterr(err, errlen, "out of memory"); return -1; }
+            if (!out->body) { conn_close(&cc); free(in.d); seterr(err, errlen, "out of memory"); return -1; }
             memcpy(out->body, in.d + off, n);
             out->body[n] = '\0';
             out->bodylen = n;
         }
     }
-    close(fd);
+    conn_close(&cc);
     free(in.d);
     return 0;
 }
@@ -448,6 +516,7 @@ int os_http_server_poll(os_http_server *s, int timeout_ms, os_http_handler h, vo
     size_t rlen = 0;
     int rc;
     time_t deadline;
+    conn sc;
 
     rc = wait_fd(s->fd, 0, timeout_ms);
     if (rc < 0) return errno == EINTR ? 0 : -1;
@@ -457,6 +526,8 @@ int os_http_server_poll(os_http_server *s, int timeout_ms, os_http_handler h, vo
     set_nonblock(fd, 0);
     /* A client that connects and says nothing must not freeze the screen. */
     set_timeouts(fd, 3000);
+    sc.fd = fd;
+    sc.tls = NULL;
     deadline = time(NULL) + OS_REQUEST_DEADLINE_S;
 
     memset(&req, 0, sizeof req);
@@ -466,7 +537,7 @@ int os_http_server_poll(os_http_server *s, int timeout_ms, os_http_handler h, vo
         hend = find_crlfcrlf(in.d ? in.d : "", in.len);
         if (hend) break;
         if (time(NULL) > deadline) goto done;
-        rc = recv_more(fd, &in, OS_HTTP_MAX_HEADER);
+        rc = recv_more(&sc, &in, OS_HTTP_MAX_HEADER);
         if (rc <= 0) {
             if (rc < 0 && in.len >= OS_HTTP_MAX_HEADER) write_error(fd, 400, "headers too large");
             goto done;
@@ -510,7 +581,7 @@ int os_http_server_poll(os_http_server *s, int timeout_ms, os_http_handler h, vo
         size_t off = (size_t)(hend + 4 - in.d);
         while (in.len - off < (size_t)want) {
             if (time(NULL) > deadline) { write_error(fd, 400, "request too slow"); goto done; }
-            rc = recv_more(fd, &in, OS_HTTP_MAX_HEADER + OS_HTTP_MAX_REQ_BODY);
+            rc = recv_more(&sc, &in, OS_HTTP_MAX_HEADER + OS_HTTP_MAX_REQ_BODY);
             if (rc <= 0) { write_error(fd, 400, "incomplete request body"); goto done; }
         }
         req.body = in.d + off;

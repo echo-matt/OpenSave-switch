@@ -271,13 +271,18 @@ void ui_progress(gfx *g, const char *title, const char *stage, int pct, int fram
 int ui_games_visible(void) { return (UI_H - TOP_H - FOOT_H - 40) / GAME_ROW_H; }
 
 void ui_games(gfx *g, const ui_games_t *v) {
-    static const ui_hint hints[] = {{"^v", "Move"}, {"A", "Open"}, {"R", "Rescan"}, {"B", "Back"}};
-    static const ui_hint hints_users[] = {{"^v", "Move"}, {"A", "Open"}, {"ZL", "User"}, {"R", "Rescan"}, {"B", "Back"}};
+    ui_hint hints[4] = {{"^v", "Move"}, {"A", "Open"}, {"R", "Rescan"}, {"B", "Back"}};
+    ui_hint hints_users[5] = {{"^v", "Move"}, {"A", "Open"}, {"ZL", "User"}, {"R", "Rescan"}, {"B", "Back"}};
+    ui_hint hints_pick[3] = {{"^v", "Move"}, {"A", "Open"}, {"B", "Back"}};
     int i, vis = ui_games_visible(), y0 = TOP_H + 20, x = MARGIN, w = UI_W - 2 * MARGIN;
     char buf[64];
 
     background(g);
-    top_bar(g, "Games", v->user ? v->user : "No account", v->user ? C_ACCENT : C_FAINT);
+    if (v->action) {
+        hints[1].label = hints_users[1].label = hints_pick[1].label = v->action;
+    }
+    if (v->picker) top_bar(g, v->title ? v->title : "Choose", NULL, 0);
+    else top_bar(g, v->title ? v->title : "Games", v->user ? v->user : "No account", v->user ? C_ACCENT : C_FAINT);
     if (v->status) {
         text_center(g, &font_small, 0, UI_W, y0 + 8, v->status, C_MUTED);
     }
@@ -301,16 +306,18 @@ void ui_games(gfx *g, const ui_games_t *v) {
         gfx_rrect(g, UI_W - MARGIN - 8, y0 + 28, 6, th, 3, gfx_alpha(C_BORDER, 120));
         gfx_rrect(g, UI_W - MARGIN - 8, by, 6, bh, 3, C_FAINT);
     }
-    snprintf(buf, sizeof buf, "%d game%s", v->n, v->n == 1 ? "" : "s");
+    if (v->picker) snprintf(buf, sizeof buf, "%d game%s on the PC", v->n, v->n == 1 ? "" : "s");
+    else snprintf(buf, sizeof buf, "%d game%s", v->n, v->n == 1 ? "" : "s");
     gfx_text(g, &font_small, MARGIN, UI_H - FOOT_H + 30, buf, C_FAINT);
-    if (v->nusers > 1) hints_bar(g, hints_users, 5);
+    if (v->picker) hints_bar(g, hints_pick, 3);
+    else if (v->nusers > 1) hints_bar(g, hints_users, 5);
     else hints_bar(g, hints, 4);
 }
 
 /* ----------------------------------------------------------- game detail */
 
 void ui_game(gfx *g, const ui_game_t *v) {
-    static const ui_hint hints[] = {{"^v", "Move"}, {"A", "Choose"}, {"B", "Back"}};
+    static const ui_hint hints[] = {{"^v", "Move"}, {"A", "Choose"}, {"R", "Refresh"}, {"B", "Back"}};
     int i, y = TOP_H + 4, w = UI_W - 2 * MARGIN;
     char buf[64];
 
@@ -354,7 +361,7 @@ void ui_game(gfx *g, const ui_game_t *v) {
             gfx_text_fit(g, &font_small, MARGIN + 28, y + 44, w - 80, v->action_help[i], en ? C_MUTED : C_FAINT);
         y += rh;
     }
-    hints_bar(g, hints, 3);
+    hints_bar(g, hints, 4);
 }
 
 /* ---------------------------------------------------------------- result */
@@ -373,17 +380,20 @@ void ui_result(gfx *g, ui_kind kind, const char *title, const char *message, con
 
 void ui_dialog(gfx *g, ui_kind kind, const char *title, const char *message, const char *code, const char *yes,
                const char *no) {
-    int w = 760, h = code ? 430 : 340, x = (UI_W - w) / 2, y = (UI_H - h) / 2, bx, bw = 300;
+    int w = 760, x = (UI_W - w) / 2, bx, bw = 300;
+    int ml = gfx_text_wrap(NULL, &font_body, 0, 0, w - 80, 6, message, 0, 6);
+    int th = ml * (font_body.line + 6);
+    int h = 96 + th + (code ? 100 : 0) + 120, y = (UI_H - h) / 2;
     uint32_t k = ui_color(kind);
     gfx_rect(g, 0, 0, UI_W, UI_H, GFX_RGBA(0, 0, 0, 170));
     gfx_rrect(g, x, y, w, h, 26, GFX_RGB(0x20, 0x23, 0x2E));
     gfx_rrect_outline(g, x, y, w, h, 26, 1, C_BORDER);
     gfx_rrect(g, x + 36, y + 36, 8, 36, 4, k);
     gfx_text_fit(g, &font_title, x + 62, y + 30, w - 100, title, C_TEXT);
-    gfx_text_wrap(g, &font_body, x + 40, y + 98, w - 80, 6, message, C_MUTED, code ? 3 : 5);
+    gfx_text_wrap(g, &font_body, x + 40, y + 98, w - 80, 6, message, C_MUTED, 6);
     if (code) {
-        gfx_rrect(g, x + 40, y + 218, w - 80, 76, 16, C_SURFACE);
-        text_center(g, &font_strong, x + 40, w - 80, y + 238, code, C_OK);
+        gfx_rrect(g, x + 40, y + 98 + th + 16, w - 80, 76, 16, C_SURFACE);
+        text_center(g, &font_strong, x + 40, w - 80, y + 98 + th + 36, code, C_OK);
     }
     {
         int by = y + h - 96;

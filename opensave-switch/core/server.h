@@ -19,6 +19,10 @@ typedef struct {
      * person can read. */
     int (*open_save)(void *ctx, const char *title_id, char *root, size_t rootlen, char *err, size_t errlen);
 
+    /* For a title linked to a game on the PC: the folder the PC should pull from
+     * (the mirror of its own files plus this Switch's changes), not the save. */
+    int (*open_linked)(void *ctx, const os_link *l, char *root, size_t rootlen, char *err, size_t errlen);
+
     /* Notifications for the interface. All optional. */
     void (*on_pairing_request)(void *ctx, const os_incoming *req);
     void (*on_paired)(void *ctx, const os_peer *peer);

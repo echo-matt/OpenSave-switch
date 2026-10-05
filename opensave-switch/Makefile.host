@@ -8,7 +8,7 @@ CC      ?= gcc
 SAN     ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined
 CFLAGS  ?= -std=gnu99 -Wall -Wextra -Wpedantic -Werror -O1 -g $(SAN)
 CORE    := core/crypto.c core/auth.c core/json.c core/http.c core/manifest.c core/fsutil.c \
-           core/state.c core/peer.c core/server.c core/sync.c core/title.c core/titlecache.c core/platform.c
+           core/state.c core/peer.c core/server.c core/sync.c core/mcd.c core/title.c core/titlecache.c core/platform.c
 BUILD   := build
 
 .PHONY: test hostcli check-switch clean
@@ -47,7 +47,7 @@ $(BUILD)/hostcli: tools/hostcli.c $(filter-out core/platform.c,$(CORE)) core/pla
 # Syntax- and type-checks the console frontend against stand-in libnx headers.
 # This is only a sanity check of this project's own code; see tests/stubs/switch.h.
 check-switch:
-	$(CC) -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fsyntax-only -D__SWITCH__ -Itests/stubs switch/main.c switch/saves.c switch/platform_switch.c
+	$(CC) -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fsyntax-only -D__SWITCH__ -Itests/stubs switch/main.c switch/saves.c switch/platform_switch.c switch/tls_switch.c
 
 clean:
 	rm -rf $(BUILD)
