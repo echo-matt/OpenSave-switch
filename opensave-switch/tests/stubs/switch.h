@@ -109,7 +109,9 @@ void sslExit(void);
 Result sslCreateContext(SslContext *c, int version);
 void sslContextClose(SslContext *c);
 Result sslContextCreateConnection(SslContext *c, SslConnection *out);
-Result sslConnectionSetSocketDescriptor(SslConnection *c, int sockfd, int *out_sockfd); /* as in libnx */
+Result sslConnectionSetSocketDescriptor(SslConnection *c, int sockfd, int *out_sockfd); /* as in libnx; apps use the wrapper below */
+int socketSslConnectionSetSocketDescriptor(SslConnection *c, int sockfd); /* -1 with errno ENOENT: none returned, ignore */
+Result socketGetLastResult(void);
 Result sslConnectionSetHostName(SslConnection *c, const char *name, u32 len);
 Result sslConnectionSetVerifyOption(SslConnection *c, int opt);
 Result sslConnectionSetIoMode(SslConnection *c, int mode);

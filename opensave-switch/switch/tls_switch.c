@@ -5,7 +5,9 @@
  * certificates of its own. It is used for one thing: reaching the conversion
  * service. The Switch's date and time must be right for a certificate to be
  * accepted. */
+#include <errno.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,43 +19,73 @@
 typedef struct {
     SslConnection conn;
     int open;
+    int out_fd; /* the descriptor the ssl service gave back; closed before the connection */
 } session;
 
 static SslContext g_ctx;
 static int g_ready;
 
+/* A failure that says which step failed, since a bare result code is of little help. */
+static void fail(char *err, size_t errlen, const char *step, Result rc) {
+    snprintf(err, errlen, "the secure connection failed at %s (0x%x). Check that the Switch is online and its date and time are right.",
+             step, (unsigned)rc);
+}
+
 static void *tls_open(int fd, const char *host, char *err, size_t errlen) {
     session *s = (session *)calloc(1, sizeof *s);
     Result rc;
     u32 out_size = 0, total_certs = 0;
-    int out_fd = -1;
 
     if (!s) {
         snprintf(err, errlen, "out of memory");
         return NULL;
     }
+    s->out_fd = -1;
     rc = sslContextCreateConnection(&g_ctx, &s->conn);
     if (R_FAILED(rc)) {
-        snprintf(err, errlen, "could not start a secure connection (0x%x)", (unsigned)rc);
+        fail(err, errlen, "starting the connection", rc);
         free(s);
         return NULL;
     }
     s->open = 1;
-    /* Check the certificate chain AND that it is for this host name. */
-    rc = sslConnectionSetSocketDescriptor(&s->conn, fd, &out_fd);
-    if (R_SUCCEEDED(rc)) rc = sslConnectionSetHostName(&s->conn, host, (u32)strlen(host));
-    if (R_SUCCEEDED(rc)) rc = sslConnectionSetVerifyOption(&s->conn, SslVerifyOption_PeerCa | SslVerifyOption_HostName);
-    if (R_SUCCEEDED(rc)) rc = sslConnectionSetIoMode(&s->conn, SslIoMode_Blocking);
-    if (R_SUCCEEDED(rc)) rc = sslConnectionDoHandshake(&s->conn, &out_size, &total_certs, NULL, 0);
+
+    /* The ssl service does not take a C library descriptor: libnx's own wrapper
+     * turns it into the socket layer's and hands back a second descriptor, which
+     * must be closed before the connection is. (-1 with ENOENT means it returned
+     * none, which is fine.) */
+    s->out_fd = socketSslConnectionSetSocketDescriptor(&s->conn, fd);
+    if (s->out_fd < 0 && errno != ENOENT) {
+        fail(err, errlen, "attaching the socket", socketGetLastResult());
+        goto bad;
+    }
+    rc = sslConnectionSetHostName(&s->conn, host, (u32)strlen(host));
     if (R_FAILED(rc)) {
-        snprintf(err, errlen,
-                 "the secure connection failed (0x%x). Check the Switch's date and time, and that it is online.",
-                 (unsigned)rc);
-        sslConnectionClose(&s->conn);
-        free(s);
-        return NULL;
+        fail(err, errlen, "setting the host name", rc);
+        goto bad;
+    }
+    /* Check the certificate chain AND that it is for this host name. */
+    rc = sslConnectionSetVerifyOption(&s->conn, SslVerifyOption_PeerCa | SslVerifyOption_HostName);
+    if (R_FAILED(rc)) {
+        fail(err, errlen, "setting certificate checks", rc);
+        goto bad;
+    }
+    rc = sslConnectionSetIoMode(&s->conn, SslIoMode_Blocking);
+    if (R_FAILED(rc)) {
+        fail(err, errlen, "setting the I/O mode", rc);
+        goto bad;
+    }
+    rc = sslConnectionDoHandshake(&s->conn, &out_size, &total_certs, NULL, 0);
+    if (R_FAILED(rc)) {
+        fail(err, errlen, "the handshake (the server's certificate may not be trusted by this console)", rc);
+        goto bad;
     }
     return s;
+
+bad:
+    if (s->out_fd >= 0) close(s->out_fd);
+    sslConnectionClose(&s->conn);
+    free(s);
+    return NULL;
 }
 
 static int tls_send(void *t, const void *buf, size_t len) {
@@ -74,6 +106,7 @@ static int tls_recv(void *t, void *buf, size_t len) {
 
 static void tls_close(void *t) {
     session *s = (session *)t;
+    if (s->out_fd >= 0) close(s->out_fd); /* before the connection, as the service requires */
     if (s->open) sslConnectionClose(&s->conn);
     free(s);
 }
