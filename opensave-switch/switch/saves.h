@@ -27,8 +27,15 @@ void saves_exit(void);
 /* Returns how many user accounts there are (at most max). */
 int saves_users(saves_user *out, int max);
 
-/* Installed games that keep save data, sorted by name. *out is malloc'd. */
-int saves_titles(saves_title **out, int *count);
+/* Installed games that keep save data, sorted by name. *out is malloc'd.
+ *
+ * Names and save types come from a cache on the SD card; only games it has not
+ * seen are asked about (the system returns a game's whole control record, icon
+ * included, which is what made listing slow), so after the first run this is
+ * quick. rescan discards the cache first. progress, if given, is called as the
+ * unknown games are looked up: done of total. */
+typedef void (*saves_progress_fn)(void *ctx, int done, int total);
+int saves_titles(saves_title **out, int *count, int rescan, saves_progress_fn progress, void *ctx);
 
 /* Mounts a game's save data at SAVES_MOUNT_ROOT, replacing whatever was
  * mounted. For a game with a per-user save, u is the account. Returns 0 on

@@ -18,14 +18,14 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 TARGET      := opensave-switch
 BUILD       := build-switch
-SOURCES     := switch core
+SOURCES     := switch core ui
 DATA        :=
-INCLUDES    := core switch
+INCLUDES    := core switch ui
 ROMFS       :=
 
 APP_TITLE   := OpenSave
 APP_AUTHOR  := OpenSave contributors
-APP_VERSION := 0.1.0
+APP_VERSION := 0.2.0
 
 ARCH   := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
@@ -35,7 +35,7 @@ CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS    := -lnx
+LIBS    := -lnx -lm
 LIBDIRS := $(PORTLIBS) $(LIBNX)
 
 #---------------------------------------------------------------------------------

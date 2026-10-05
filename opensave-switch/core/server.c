@@ -446,14 +446,18 @@ int os_server_start(os_server *s, os_state *st, const os_server_hooks *hooks, in
     return s->http ? 0 : -1;
 }
 
-int os_server_poll(os_server *s, int timeout_ms) { return os_http_server_poll(s->http, timeout_ms, handle, s); }
+int os_server_poll(os_server *s, int timeout_ms) {
+    /* Error screens are shown before the server exists; polling then is a no-op. */
+    if (!s->http) return 0;
+    return os_http_server_poll(s->http, timeout_ms, handle, s);
+}
 
 void os_server_stop(os_server *s) {
     if (s->http) os_http_server_stop(s->http);
     s->http = NULL;
 }
 
-int os_server_port(const os_server *s) { return os_http_server_port(s->http); }
+int os_server_port(const os_server *s) { return s->http ? os_http_server_port(s->http) : 0; }
 
 int os_server_approve(os_server *s, const char *peer_id, char *err, size_t errlen) {
     int i;

@@ -8,16 +8,18 @@ CC      ?= gcc
 SAN     ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined
 CFLAGS  ?= -std=gnu99 -Wall -Wextra -Wpedantic -Werror -O1 -g $(SAN)
 CORE    := core/crypto.c core/auth.c core/json.c core/http.c core/manifest.c core/fsutil.c \
-           core/state.c core/peer.c core/server.c core/sync.c core/title.c core/platform.c
+           core/state.c core/peer.c core/server.c core/sync.c core/title.c core/titlecache.c core/platform.c
 BUILD   := build
 
 .PHONY: test hostcli check-switch clean
-test: $(BUILD)/test_crypto $(BUILD)/test_json $(BUILD)/test_http $(BUILD)/test_title $(BUILD)/test_state
+test: $(BUILD)/ui_shots $(BUILD)/test_crypto $(BUILD)/test_json $(BUILD)/test_http $(BUILD)/test_title $(BUILD)/test_state $(BUILD)/test_titlecache
+	mkdir -p $(BUILD)/shots && $(BUILD)/ui_shots $(BUILD)/shots
 	$(BUILD)/test_crypto tests/vectors.txt
 	$(BUILD)/test_json
 	$(BUILD)/test_http
 	$(BUILD)/test_title
 	$(BUILD)/test_state
+	$(BUILD)/test_titlecache
 	bash tests/run_manifest_test.sh
 
 hostcli: $(BUILD)/hostcli
@@ -27,6 +29,8 @@ $(BUILD):
 
 $(BUILD)/test_crypto: tests/test_crypto.c core/crypto.c core/auth.c tests/host_random.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
+$(BUILD)/ui_shots: tests/ui_shots.c ui/gfx.c ui/ui.c ui/font_data.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 $(BUILD)/test_json: tests/test_json.c core/json.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 $(BUILD)/test_http: tests/test_http.c core/http.c | $(BUILD)
@@ -34,6 +38,8 @@ $(BUILD)/test_http: tests/test_http.c core/http.c | $(BUILD)
 $(BUILD)/test_title: tests/test_title.c core/title.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 $(BUILD)/test_state: tests/test_state.c core/state.c core/crypto.c core/auth.c core/json.c core/fsutil.c core/platform.c tests/host_random.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+$(BUILD)/test_titlecache: tests/test_titlecache.c core/titlecache.c core/json.c core/fsutil.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 $(BUILD)/hostcli: tools/hostcli.c $(filter-out core/platform.c,$(CORE)) core/platform.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^

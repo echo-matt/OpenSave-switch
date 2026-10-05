@@ -26,6 +26,17 @@ void consoleUpdate(void *);
 void consoleExit(void *);
 void consoleClear(void);
 
+/* framebuffer */
+typedef struct NWindow NWindow;
+typedef struct { int dummy; } Framebuffer;
+#define PIXEL_FORMAT_RGBA_8888 1
+NWindow *nwindowGetDefault(void);
+Result framebufferCreate(Framebuffer *fb, NWindow *win, u32 w, u32 h, u32 format, u32 num_fbs);
+void framebufferMakeLinear(Framebuffer *fb);
+void *framebufferBegin(Framebuffer *fb, u32 *stride);
+void framebufferEnd(Framebuffer *fb);
+void framebufferClose(Framebuffer *fb);
+
 /* input */
 typedef struct { u64 buttons; } PadState;
 enum {

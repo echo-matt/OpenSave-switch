@@ -1,11 +1,14 @@
 /* OpenSave for Nintendo Switch.
  *
- * A console interface over the portable core in ../core: pair with the OpenSave
- * app on a PC, then take a game's save from the PC onto this Switch, or send
- * this Switch's save to the PC.
+ * Pair with the OpenSave app on a PC, then take a game's save from the PC onto
+ * this Switch, or send this Switch's save to the PC.
  *
- * Needs custom firmware (Atmosphere): only homebrew running with full file
- * system access can open the save data of other games.
+ * The interface is drawn straight into the screen's framebuffer by the portable
+ * renderer in ../ui (the same code the PC tests render screenshots with); the
+ * work is done by the portable core in ../core.
+ *
+ * Needs custom firmware (Atmosphere): only homebrew with full file system
+ * access can open the save data of other games.
  */
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -27,44 +30,47 @@
 #include "../core/state.h"
 #include "../core/sync.h"
 #include "../core/title.h"
+#include "../ui/ui.h"
 #include "saves.h"
 
 #define CONFIG_PATH "sdmc:/config/opensave/state.json"
 #define BACKUP_ROOT "sdmc:/switch/OpenSave/backups"
 #define STAGING_ROOT "sdmc:/switch/OpenSave/staging"
 #define KEEP_BACKUPS 3
-#define PAGE_ROWS 20
+#define APP_VERSION "OpenSave for Switch 0.2.0"
 
-#define C_RED "\x1b[31;1m"
-#define C_GRN "\x1b[32;1m"
-#define C_YEL "\x1b[33;1m"
-#define C_CYN "\x1b[36;1m"
-#define C_RST "\x1b[0m"
-
-typedef enum { SCR_MAIN, SCR_PAIR, SCR_WAIT_PAIR, SCR_GAMES, SCR_GAME } screen_t;
+/* ------------------------------------------------------------------ state */
 
 static os_state g_st;
 static os_server g_srv;
 static PadState g_pad;
-static int g_dirty = 1;
-static char g_banner[300];        /* a line shown on the main screen: what last happened */
-static int g_paired_event;        /* the server reports a pairing completed */
-static char g_served[80];         /* what the server last did, for the transfer screens */
+static Framebuffer g_fb;
+static gfx g_gfx;
+static int g_frame;
+
+static char g_banner[300];
+static ui_kind g_banner_kind = UI_INFO;
+static int g_paired_event;
+static char g_served[80];
 
 static saves_user g_users[ACC_USER_LIST_SIZE];
 static int g_nusers, g_user;
 static saves_title *g_titles;
-static int g_ntitles, g_sel, g_top;
+static ui_game_row *g_rows;
+static int g_ntitles;
 
-/* ----------------------------------------------------------------- helpers */
+/* --------------------------------------------------------------- drawing */
 
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void say(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    consoleUpdate(NULL);
+typedef void (*draw_fn)(gfx *g, void *arg);
+
+/* Draws one frame and shows it; this also paces the loop to the display. */
+static void frame(draw_fn fn, void *arg) {
+    u32 stride;
+    u32 *px = (u32 *)framebufferBegin(&g_fb, &stride);
+    gfx_init(&g_gfx, px, UI_W, UI_H, (int)(stride / 4));
+    fn(&g_gfx, arg);
+    framebufferEnd(&g_fb);
+    g_frame++;
 }
 
 static os_peer *the_peer(void) {
@@ -74,47 +80,95 @@ static os_peer *the_peer(void) {
     return NULL;
 }
 
+static void set_banner(ui_kind k, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void set_banner(ui_kind k, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_banner, sizeof g_banner, fmt, ap);
+    va_end(ap);
+    g_banner_kind = k;
+}
+
 static const char *local_ip(char *buf, size_t n) {
     struct in_addr a;
     a.s_addr = (in_addr_t)gethostid();
-    if (a.s_addr == 0 || a.s_addr == htonl(INADDR_LOOPBACK)) {
-        snprintf(buf, n, "not connected");
-    } else {
-        snprintf(buf, n, "%s", inet_ntoa(a));
-    }
+    if (a.s_addr == 0 || a.s_addr == htonl(INADDR_LOOPBACK)) snprintf(buf, n, "not connected");
+    else snprintf(buf, n, "%s", inet_ntoa(a));
     return buf;
 }
 
-static void wait_for_a(void) {
-    say("\nPress A to continue.\n");
+/* A one-shot busy frame, for work that blocks (the spinner holds still). */
+typedef struct {
+    const char *title, *sub;
+    const ui_hint *hints;
+    int nhints;
+} busy_t;
+static void d_busy(gfx *g, void *a) {
+    busy_t *b = (busy_t *)a;
+    ui_busy(g, b->title, b->sub, b->hints, b->nhints, g_frame);
+}
+static void show_busy(const char *title, const char *sub) {
+    busy_t b = {title, sub, NULL, 0};
+    frame(d_busy, &b);
+}
+
+/* ------------------------------------------------------- results, dialogs */
+
+typedef struct {
+    ui_kind kind;
+    const char *title, *msg;
+} result_t;
+static void d_result(gfx *g, void *a) {
+    result_t *r = (result_t *)a;
+    ui_result(g, r->kind, r->title, r->msg, NULL, 0);
+}
+
+/* Shows an outcome until A or B is pressed. */
+static void show_result(ui_kind kind, const char *title, const char *msg) {
+    result_t r = {kind, title, msg};
     while (appletMainLoop()) {
         padUpdate(&g_pad);
         if (padGetButtonsDown(&g_pad) & (HidNpadButton_A | HidNpadButton_B)) return;
         os_server_poll(&g_srv, 0);
-        consoleUpdate(NULL);
+        frame(d_result, &r);
     }
 }
 
-/* Yes/no: A confirms, B declines. */
-static int confirm(void) {
+typedef struct {
+    draw_fn under;
+    void *under_arg;
+    ui_kind kind;
+    const char *title, *msg, *code, *yes, *no;
+} dialog_t;
+static void d_dialog(gfx *g, void *a) {
+    dialog_t *d = (dialog_t *)a;
+    if (d->under) d->under(g, d->under_arg);
+    ui_dialog(g, d->kind, d->title, d->msg, d->code, d->yes, d->no);
+}
+
+/* A confirmation over what was on screen: A says yes, B says no. */
+static int confirm(draw_fn under, void *under_arg, ui_kind kind, const char *title, const char *msg, const char *code,
+                   const char *yes, const char *no) {
+    dialog_t d = {under, under_arg, kind, title, msg, code, yes, no};
     while (appletMainLoop()) {
-        u64 d;
+        u64 down;
         padUpdate(&g_pad);
-        d = padGetButtonsDown(&g_pad);
-        if (d & HidNpadButton_A) return 1;
-        if (d & HidNpadButton_B) return 0;
+        down = padGetButtonsDown(&g_pad);
+        if (down & HidNpadButton_A) return 1;
+        if (down & HidNpadButton_B) return 0;
         os_server_poll(&g_srv, 0);
-        consoleUpdate(NULL);
+        frame(d_dialog, &d);
     }
     return 0;
 }
 
-/* Serves the PC for a few seconds, so it can call back after a transfer. */
-static void linger(int seconds) {
+/* Serves the PC for a few seconds behind a spinner, so it can call back. */
+static void linger(const char *title, const char *sub, int seconds) {
     time_t end = time(NULL) + seconds;
+    busy_t b = {title, sub, NULL, 0};
     while (appletMainLoop() && time(NULL) < end) {
-        os_server_poll(&g_srv, 100);
-        consoleUpdate(NULL);
+        os_server_poll(&g_srv, 0);
+        frame(d_busy, &b);
     }
 }
 
@@ -141,21 +195,18 @@ static int hook_open_save(void *ctx, const char *tid, char *root, size_t rootlen
 static void hook_pairing_request(void *ctx, const os_incoming *req) {
     (void)ctx;
     (void)req;
-    g_dirty = 1;
 }
 
 static void hook_paired(void *ctx, const os_peer *p) {
     (void)ctx;
     (void)p;
     g_paired_event = 1;
-    g_dirty = 1;
 }
 
 static void hook_unpaired(void *ctx, const char *id) {
     (void)ctx;
     (void)id;
-    snprintf(g_banner, sizeof g_banner, "The PC unpaired this Switch.");
-    g_dirty = 1;
+    set_banner(UI_WARN, "The PC unpaired this Switch.");
 }
 
 static void hook_peer_update(void *ctx, const os_peer *p, const char *game, const char *tid) {
@@ -165,12 +216,10 @@ static void hook_peer_update(void *ctx, const os_peer *p, const char *game, cons
     (void)game;
     for (i = 0; i < g_ntitles; i++)
         if (strcasecmp(g_titles[i].tid, tid) == 0) {
-            snprintf(g_banner, sizeof g_banner, "The PC has newer progress for %s.", g_titles[i].name);
-            g_dirty = 1;
+            set_banner(UI_INFO, "The PC has newer progress for %s.", g_titles[i].name);
             return;
         }
-    snprintf(g_banner, sizeof g_banner, "The PC has newer progress for a game (%s).", tid);
-    g_dirty = 1;
+    set_banner(UI_INFO, "The PC has newer progress for a game (%s).", tid);
 }
 
 static void hook_served(void *ctx, const char *what) {
@@ -178,46 +227,47 @@ static void hook_served(void *ctx, const char *what) {
     snprintf(g_served, sizeof g_served, "%s", what);
 }
 
-/* ----------------------------------------------------------------- screens */
+/* ------------------------------------------------------------------- home */
 
-static void draw_main(void) {
-    char ip[32], hint[300];
+typedef struct {
+    ui_home_t v;
+    char address[64], peer_addr[80], fp[OS_FINGERPRINT_LEN], hint[300];
+    const char *items[4];
+} home_t;
+
+static void d_home(gfx *g, void *a) { ui_home(g, &((home_t *)a)->v); }
+
+static void build_home(home_t *h, int sel) {
+    char ip[32];
     os_peer *p = the_peer();
-    time_t now = time(NULL);
-    struct tm tmv;
-
-    consoleClear();
-    printf(C_CYN "OpenSave for Switch" C_RST "  v0.1.0\n");
-    printf("------------------------------------------------------------\n");
-    printf("This Switch : %s\n", g_st.device_name);
-    printf("Address     : %s : %d\n", local_ip(ip, sizeof ip), os_server_port(&g_srv));
-    gmtime_r(&now, &tmv);
-    printf("Clock (UTC) : %04d-%02d-%02d %02d:%02d\n", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour,
-           tmv.tm_min);
-    if (os_clock_hint(&g_st, hint, sizeof hint)[0]) printf(C_RED "%s\n" C_RST, hint);
+    memset(h, 0, sizeof *h);
+    h->v.device_name = g_st.device_name;
+    snprintf(h->address, sizeof h->address, "%s : %d", local_ip(ip, sizeof ip), os_server_port(&g_srv));
+    h->v.address = h->address;
+    h->v.version = APP_VERSION;
     if (p) {
-        char fp[OS_FINGERPRINT_LEN];
-        os_fingerprint(fp, g_st.pub, p->pubkey);
-        printf("Paired with : " C_GRN "%s" C_RST " (%s:%d)\n", p->name, p->address, p->port);
-        printf("Fingerprint : %s\n", fp);
+        snprintf(h->peer_addr, sizeof h->peer_addr, "%s : %d", p->address, p->port);
+        os_fingerprint(h->fp, g_st.pub, p->pubkey);
+        h->v.paired = 1;
+        h->v.peer_name = p->name;
+        h->v.peer_addr = h->peer_addr;
+        h->v.fingerprint = h->fp;
+        h->items[0] = "Games";
+        h->items[1] = "Pair with a different PC";
+        h->items[2] = "Exit";
+        h->v.nitems = 3;
     } else {
-        printf("Paired with : " C_YEL "nobody yet" C_RST "\n");
+        h->items[0] = "Pair with a PC";
+        h->items[1] = "Exit";
+        h->v.nitems = 2;
     }
-    printf("------------------------------------------------------------\n\n");
-    if (g_banner[0]) printf(C_YEL "%s\n\n" C_RST, g_banner);
-    if (p) {
-        printf(" A  Games: send or receive a save\n");
-        printf(" Y  Pair with a different PC / unpair\n");
-    } else {
-        printf(" A  Pair with a PC\n");
+    h->v.items = h->items;
+    h->v.sel = sel;
+    if (g_banner[0]) {
+        h->v.banner = g_banner;
+        h->v.banner_kind = g_banner_kind;
     }
-    printf(" +  Exit\n\n");
-    if (!p) {
-        printf("On the PC, open OpenSave and check that it is running.\n");
-        printf("Then press A here, enter the PC's address, and approve\n");
-        printf("this Switch under Devices in the OpenSave app.\n");
-    }
-    consoleUpdate(NULL);
+    if (os_clock_hint(&g_st, h->hint, sizeof h->hint)[0]) h->v.clock_warning = h->hint;
 }
 
 /* Offers a pairing request somebody sent this Switch. */
@@ -225,48 +275,36 @@ static void handle_incoming(void) {
     int i;
     for (i = 0; i < OS_MAX_PENDING; i++) {
         os_incoming *in = &g_st.incoming[i];
-        char fp[OS_FINGERPRINT_LEN], id[64], err[200];
+        char fp[OS_FINGERPRINT_LEN], id[64], err[200], msg[200];
+        home_t h;
         if (!in->in_use) continue;
         if (in->has_key) os_fingerprint(fp, g_st.pub, in->pubkey);
         else snprintf(fp, sizeof fp, "(no key)");
         snprintf(id, sizeof id, "%s", in->peer_id);
-        consoleClear();
-        printf(C_CYN "Pairing request" C_RST "\n\n");
-        printf("\"%s\" at %s wants to pair with this Switch.\n\n", in->name, in->address);
-        printf("Its fingerprint: " C_YEL "%s" C_RST "\n", fp);
-        printf("Check that the PC shows the same one.\n\n");
-        printf(" A  Approve      B  Reject\n");
-        consoleUpdate(NULL);
-        if (confirm()) {
-            if (os_server_approve(&g_srv, id, err, sizeof err) != 0) snprintf(g_banner, sizeof g_banner, "%s", err);
-            else snprintf(g_banner, sizeof g_banner, "Paired.");
+        snprintf(msg, sizeof msg, "\"%s\" at %s wants to pair. Check that the PC shows the same code.", in->name,
+                 in->address);
+        build_home(&h, 0);
+        if (confirm(d_home, &h, UI_INFO, "Pairing request", msg, fp, "Approve", "Reject")) {
+            if (os_server_approve(&g_srv, id, err, sizeof err) != 0) set_banner(UI_ERR, "%s", err);
+            else set_banner(UI_OK, "Paired.");
         } else {
             os_server_reject(&g_srv, id);
         }
-        g_dirty = 1;
     }
 }
 
-/* Address entry: four numbers and a port, edited with the D-pad. */
+/* ------------------------------------------------------------------- pair */
+
 static int g_ip[4] = {192, 168, 1, 2};
 static int g_port = OS_DEFAULT_PORT, g_cursor;
 
-static void draw_pair(void) {
-    int i;
-    consoleClear();
-    printf(C_CYN "Pair with a PC" C_RST "\n\n");
-    printf("Enter the PC's address (shown in OpenSave on the PC, under Devices).\n\n   ");
-    for (i = 0; i < 4; i++) {
-        printf("%s%3d%s%s", g_cursor == i ? C_YEL "[" : " ", g_ip[i], g_cursor == i ? "]" C_RST : " ", i < 3 ? "." : "");
-    }
-    printf(" :%s%5d%s\n\n", g_cursor == 4 ? C_YEL "[" : " ", g_port, g_cursor == 4 ? "]" C_RST : " ");
-    printf(" Left/Right  choose a part      Up/Down  +1 / -1\n");
-    printf(" L / R       -10 / +10          A        send request\n");
-    printf(" B           back\n");
-    consoleUpdate(NULL);
+static ui_pair_t g_pairview;
+static void d_pair(gfx *g, void *a) {
+    (void)a;
+    ui_pair(g, &g_pairview);
 }
 
-static int pair_input(u64 down) {
+static void pair_input(u64 down) {
     int *v, hi, lo;
     if (down & HidNpadButton_Left) g_cursor = (g_cursor + 4) % 5;
     if (down & HidNpadButton_Right) g_cursor = (g_cursor + 1) % 5;
@@ -279,119 +317,137 @@ static int pair_input(u64 down) {
     if (down & HidNpadButton_L) *v -= g_cursor < 4 ? 10 : 100;
     if (*v > hi) *v = lo;
     if (*v < lo) *v = hi;
-    return down != 0;
 }
 
 /* Sends the request and waits for the PC to approve it. */
 static void do_pair(void) {
-    char addr[48], err[300];
+    char addr[48], err[300], sub[120];
     os_ping_info info;
     time_t end;
     os_peer *p;
+    static const ui_hint cancel[] = {{"B", "Cancel"}};
+    busy_t b;
 
     snprintf(addr, sizeof addr, "%d.%d.%d.%d", g_ip[0], g_ip[1], g_ip[2], g_ip[3]);
-    consoleClear();
-    printf("Contacting %s:%d ...\n", addr, g_port);
-    consoleUpdate(NULL);
+    snprintf(sub, sizeof sub, "%s : %d", addr, g_port);
+    show_busy("Contacting the PC", sub);
     if (os_peer_ping(&g_st, addr, g_port, &info, err, sizeof err) != 0) {
-        printf(C_RED "\nCould not reach OpenSave there:\n%s\n" C_RST, err);
-        wait_for_a();
+        show_result(UI_ERR, "Could not reach OpenSave there", err);
         return;
     }
-    printf("Found \"%s\" (OpenSave %s).\n", info.device_name, info.version);
-    consoleUpdate(NULL);
     g_paired_event = 0;
     if (os_peer_handshake(&g_st, addr, g_port, err, sizeof err) != 0) {
-        printf(C_RED "\nThe pairing request failed:\n%s\n" C_RST, err);
-        wait_for_a();
+        show_result(UI_ERR, "The pairing request failed", err);
         return;
     }
-    printf("\nRequest sent. " C_YEL "Approve this Switch in OpenSave on the PC" C_RST "\n(Devices tab). Waiting...  (B cancels)\n");
-    consoleUpdate(NULL);
+    b.title = "Waiting for approval";
+    b.sub = "Approve this Switch in OpenSave on the PC, under Devices.";
+    b.hints = cancel;
+    b.nhints = 1;
     end = time(NULL) + 120;
     while (appletMainLoop() && !g_paired_event && time(NULL) < end) {
         padUpdate(&g_pad);
         if (padGetButtonsDown(&g_pad) & HidNpadButton_B) break;
-        os_server_poll(&g_srv, 100);
-        consoleUpdate(NULL);
+        os_server_poll(&g_srv, 0);
+        frame(d_busy, &b);
     }
     p = the_peer();
     if (g_paired_event && p) {
-        char fp[OS_FINGERPRINT_LEN];
+        char fp[OS_FINGERPRINT_LEN], msg[300];
         os_fingerprint(fp, g_st.pub, p->pubkey);
-        consoleClear();
-        printf(C_GRN "Paired with %s." C_RST "\n\n", p->name);
-        printf("Fingerprint: " C_YEL "%s" C_RST "\n\n", fp);
-        printf("The PC shows the same code for this pairing. If the two codes\n");
-        printf("differ, someone on the network is interfering: unpair on both.\n");
-        wait_for_a();
-        snprintf(g_banner, sizeof g_banner, "Paired with %s.", p->name);
+        snprintf(msg, sizeof msg,
+                 "Fingerprint  %s\nThe PC shows the same code. If the two differ, someone on the network is interfering: unpair on both.",
+                 fp);
+        show_result(UI_OK, "Paired", msg);
+        set_banner(UI_OK, "Paired with %s.", p->name);
     } else {
-        printf("\nNo approval arrived.\n");
-        wait_for_a();
+        show_result(UI_WARN, "No approval arrived", "Open OpenSave on the PC, check Devices, and try again.");
     }
 }
 
 static void do_unpair(void) {
     os_peer *p = the_peer();
-    char err[200];
+    char err[200], msg[160];
+    home_t h;
     if (!p) return;
-    consoleClear();
-    printf("Unpair from %s?\n\n A  Unpair    B  Cancel\n", p->name);
-    consoleUpdate(NULL);
-    if (!confirm()) return;
-    if (os_peer_unpair(&g_st, p, err, sizeof err) != 0) printf("(the PC could not be told: %s)\n", err);
+    snprintf(msg, sizeof msg, "This Switch will stop syncing with %s. Your saves are not touched.", p->name);
+    build_home(&h, 1);
+    if (!confirm(d_home, &h, UI_WARN, "Unpair?", msg, NULL, "Unpair", "Cancel")) return;
+    os_peer_unpair(&g_st, p, err, sizeof err); /* best effort: the PC may be off */
     os_state_remove_peer(&g_st, p->id);
     os_state_save(&g_st, err, sizeof err);
-    snprintf(g_banner, sizeof g_banner, "Unpaired.");
+    set_banner(UI_INFO, "Unpaired.");
 }
 
-/* ------------------------------------------------------------------- games */
+/* ------------------------------------------------------------------ games */
 
-static int load_games(void) {
+static ui_games_t g_gamesview;
+static char g_status[64];
+static void d_games(gfx *g, void *a) {
+    (void)a;
+    ui_games(g, &g_gamesview);
+}
+
+static void rebuild_rows(void) {
+    int i;
+    free(g_rows);
+    g_rows = (ui_game_row *)calloc((size_t)(g_ntitles ? g_ntitles : 1), sizeof *g_rows);
+    for (i = 0; g_rows && i < g_ntitles; i++) {
+        g_rows[i].name = g_titles[i].name;
+        g_rows[i].tid = g_titles[i].tid;
+        g_rows[i].kind = g_titles[i].has_user_save ? "Account save" : "Console save";
+    }
+}
+
+static void scan_progress(void *ctx, int done, int total) {
+    (void)ctx;
+    snprintf(g_status, sizeof g_status, "Reading games   %d / %d", done, total);
+    g_gamesview.status = g_status;
+    g_gamesview.n = 0;
+    frame(d_games, NULL);
+}
+
+static int load_games(int rescan) {
     free(g_titles);
     g_titles = NULL;
     g_ntitles = 0;
-    consoleClear();
-    printf("Reading the installed games...\n");
-    consoleUpdate(NULL);
-    if (saves_titles(&g_titles, &g_ntitles) != 0) {
-        printf(C_RED "Could not list the installed games.\n" C_RST);
-        wait_for_a();
+    memset(&g_gamesview, 0, sizeof g_gamesview);
+    g_gamesview.user = g_nusers ? g_users[g_user].nickname : NULL;
+    g_gamesview.nusers = g_nusers;
+    snprintf(g_status, sizeof g_status, "Reading games");
+    g_gamesview.status = g_status;
+    frame(d_games, NULL);
+    if (saves_titles(&g_titles, &g_ntitles, rescan, scan_progress, NULL) != 0) {
+        show_result(UI_ERR, "Could not list your games", "The system would not list the installed games.");
         return -1;
     }
-    g_sel = g_top = 0;
+    rebuild_rows();
     return 0;
 }
 
-static void draw_games(void) {
-    int i;
-    consoleClear();
-    printf(C_CYN "Games" C_RST "   user: %s\n", g_nusers ? g_users[g_user].nickname : "(none)");
-    printf("------------------------------------------------------------\n");
-    if (g_ntitles == 0) printf("No installed games with save data.\n");
-    for (i = g_top; i < g_ntitles && i < g_top + PAGE_ROWS; i++)
-        printf("%s %-.52s\n", i == g_sel ? C_YEL ">" : " ", g_titles[i].name);
-    printf(C_RST "------------------------------------------------------------\n");
-    printf(" A  open    ZL/ZR  change user    B  back\n");
-    consoleUpdate(NULL);
+typedef struct {
+    const char *title, *stage;
+    int pct;
+} prog_t;
+static prog_t g_prog;
+static int g_last_pct = -2;
+static char g_last_stage[64];
+
+static void d_progress(gfx *g, void *a) {
+    prog_t *p = (prog_t *)a;
+    ui_progress(g, p->title, p->stage, p->pct, g_frame);
 }
 
-typedef struct {
-    const char *stage;
-    int last_pct;
-    char last_stage[64];
-} prog_t;
-
 static void on_progress(void *ctx, const char *stage, int64_t done, int64_t total) {
-    prog_t *p = (prog_t *)ctx;
     int pct = total > 0 ? (int)(done * 100 / total) : -1;
-    if (strcmp(p->last_stage, stage) == 0 && pct == p->last_pct) return;
-    snprintf(p->last_stage, sizeof p->last_stage, "%s", stage);
-    p->last_pct = pct;
-    if (pct >= 0) printf("\r%-48.48s %3d%%", stage, pct);
-    else printf("\r%-48.48s     ", stage);
-    consoleUpdate(NULL);
+    (void)ctx;
+    /* Redraw when something visible changed; every block is not worth a frame. */
+    if (pct == g_last_pct && strcmp(g_last_stage, stage) == 0) return;
+    g_last_pct = pct;
+    snprintf(g_last_stage, sizeof g_last_stage, "%s", stage);
+    g_prog.stage = g_last_stage;
+    g_prog.pct = pct;
+    frame(d_progress, &g_prog);
 }
 
 static int on_cancel(void *ctx) {
@@ -444,10 +500,9 @@ static void prune_backups(const char *tid) {
 }
 
 static void do_pull(const saves_title *t, const char *game_id, const char *name, const char *save_path) {
-    char backup[400], staging[300], err[400], root[16], stamp[32];
+    char backup[400], staging[300], err[400], stamp[32], head[300], msg[400];
     os_pull_result res;
     os_progress pr;
-    prog_t prog;
     time_t now = time(NULL);
     struct tm tmv;
     os_peer *p = the_peer();
@@ -457,217 +512,266 @@ static void do_pull(const saves_title *t, const char *game_id, const char *name,
     strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
     snprintf(backup, sizeof backup, "%s/%s/%s", BACKUP_ROOT, t->tid, stamp);
     snprintf(staging, sizeof staging, "%s/%s", STAGING_ROOT, t->tid);
-    snprintf(root, sizeof root, "%s", SAVES_MOUNT_ROOT);
+    snprintf(head, sizeof head, "Receiving %s", name);
 
-    consoleClear();
-    printf(C_CYN "Receiving %s" C_RST "\n(hold B to cancel)\n\n", name);
-    consoleUpdate(NULL);
-    memset(&prog, 0, sizeof prog);
-    prog.last_pct = -2;
-    pr.ctx = &prog;
+    g_prog.title = head;
+    g_prog.stage = "Asking the PC what it has";
+    g_prog.pct = -1;
+    g_last_pct = -2;
+    g_last_stage[0] = '\0';
+    frame(d_progress, &g_prog);
+    pr.ctx = NULL;
     pr.progress = on_progress;
     pr.cancelled = on_cancel;
 
-    if (os_pull(&g_st, p, game_id, name, save_path, root, backup, staging, &pr, &res, err, sizeof err) != 0) {
-        /* Nothing is committed: the save is as it was. */
-        saves_unmount();
-        printf(C_RED "\n\nNot changed.\n%s\n" C_RST, err);
-        wait_for_a();
+    if (os_pull(&g_st, p, game_id, name, save_path, SAVES_MOUNT_ROOT, backup, staging, &pr, &res, err, sizeof err) != 0) {
+        saves_unmount(); /* nothing was committed: the save is as it was */
+        show_result(UI_ERR, "Nothing was changed", err);
         return;
     }
     if (res.already_same) {
-        printf(C_GRN "\n\nAlready identical to the PC's. Nothing to do.\n" C_RST);
-        wait_for_a();
+        show_result(UI_OK, "Already identical", "This Switch's save already matches the PC's. Nothing to do.");
         return;
     }
     if (saves_commit(err, sizeof err) != 0) {
         saves_unmount();
-        printf(C_RED "\n\n%s\n" C_RST, err);
-        wait_for_a();
+        show_result(UI_ERR, "The save was not kept", err);
         return;
     }
     prune_backups(t->tid);
-    printf(C_GRN "\n\nDone: %d file(s) received, %d removed.\n" C_RST, res.files_downloaded, res.files_deleted);
-    if (res.backup_path[0]) printf("The previous save is backed up at:\n  %s\n", res.backup_path);
-    if (res.remote_has_extra_roots)
-        printf(C_YEL "The PC tracks extra save folders for this game; only the main one was received.\n" C_RST);
-    consoleUpdate(NULL);
-    if (os_report_in_sync(&g_st, p, game_id, res.manifest_hash, err, sizeof err) != 0)
-        printf("(could not tell the PC: %s)\n", err);
-    else
-        linger(5); /* the PC calls back to confirm */
-    wait_for_a();
+    snprintf(msg, sizeof msg, "%d file%s received, %d removed. The previous save is backed up on the SD card.%s",
+             res.files_downloaded, res.files_downloaded == 1 ? "" : "s", res.files_deleted,
+             res.remote_has_extra_roots ? " The PC keeps extra save folders for this game; only the main one was received." : "");
+    if (os_report_in_sync(&g_st, p, game_id, res.manifest_hash, err, sizeof err) == 0)
+        linger("Confirming with the PC", NULL, 4); /* the PC calls back to check */
+    show_result(UI_OK, "Saved to this Switch", msg);
 }
 
-static void do_restore(const saves_title *t) {
+static void do_restore(const saves_title *t, draw_fn under, void *under_arg) {
     char backup[400], err[300];
     newest_backup(t->tid, backup, sizeof backup);
-    consoleClear();
     if (!backup[0]) {
-        printf("There is no backup of this game's save.\n");
-        wait_for_a();
+        show_result(UI_INFO, "No backup yet", "A backup is made each time a save is received from the PC.");
         return;
     }
-    printf(C_CYN "Restore the previous save?" C_RST "\n\nThis replaces the Switch's current save with:\n  %s\n\n A  Restore    B  Cancel\n", backup);
-    consoleUpdate(NULL);
-    if (!confirm()) return;
+    if (!confirm(under, under_arg, UI_WARN, "Restore the previous save?",
+                 "This replaces the Switch's current save with the one backed up before the last receive.", NULL, "Restore",
+                 "Cancel"))
+        return;
+    show_busy("Restoring", NULL);
     if (os_restore_backup(SAVES_MOUNT_ROOT, backup, err, sizeof err) != 0) {
         saves_unmount();
-        printf(C_RED "\n%s\n" C_RST, err);
-        wait_for_a();
+        show_result(UI_ERR, "Could not restore", err);
         return;
     }
     if (saves_commit(err, sizeof err) != 0) {
         saves_unmount();
-        printf(C_RED "\n%s\n" C_RST, err);
-        wait_for_a();
+        show_result(UI_ERR, "The save was not kept", err);
         return;
     }
-    printf(C_GRN "\nRestored.\n" C_RST);
-    wait_for_a();
+    show_result(UI_OK, "Restored", "The previous save is back.");
 }
 
 static void do_push(const char *game_id) {
-    char err[300];
+    char err[300], sub[160];
     os_peer *p = the_peer();
     time_t end;
+    int served = 0;
+    static const ui_hint stop[] = {{"B", "Stop waiting"}};
+    busy_t b;
+
     if (!p) return;
-    consoleClear();
+    show_busy("Asking the PC", NULL);
     if (os_peer_trigger_sync(&g_st, p, game_id, err, sizeof err) != 0) {
-        printf(C_RED "The PC could not be asked to sync:\n%s\n" C_RST, err);
-        wait_for_a();
+        show_result(UI_ERR, "The PC could not be asked to sync", err);
         return;
     }
-    printf(C_GRN "Asked the PC to take this Switch's save.\n" C_RST);
-    printf("\nThe PC now reads the save from this Switch. Keep this screen\n");
-    printf("open until it finishes. If both sides changed, OpenSave on the\n");
-    printf("PC asks which to keep. (B to stop waiting)\n\n");
-    consoleUpdate(NULL);
+    snprintf(sub, sizeof sub, "The PC is reading this Switch's save. Keep this screen open.");
+    b.title = "Sending to the PC";
+    b.sub = sub;
+    b.hints = stop;
+    b.nhints = 1;
     g_served[0] = '\0';
     end = time(NULL) + 90;
     while (appletMainLoop() && time(NULL) < end) {
         padUpdate(&g_pad);
         if (padGetButtonsDown(&g_pad) & HidNpadButton_B) break;
-        if (os_server_poll(&g_srv, 100) == 1 && g_served[0]) {
-            printf("\r%-60.60s", g_served);
-            consoleUpdate(NULL);
+        if (os_server_poll(&g_srv, 0) == 1 && g_served[0]) {
+            served = 1;
+            snprintf(sub, sizeof sub, "%s...", g_served);
             end = time(NULL) + 15; /* it is working: allow it time to finish */
         }
-        consoleUpdate(NULL);
+        frame(d_busy, &b);
     }
-    printf("\n");
+    show_result(served ? UI_OK : UI_INFO, served ? "The PC read this save" : "The PC was asked",
+                served ? "If both sides had changed, OpenSave on the PC asks which to keep."
+                       : "Nothing was requested from this Switch yet. Check OpenSave on the PC.");
 }
 
-static const char *cmp_text(const os_cmp_result *r, char *buf, size_t n) {
-    switch (r->state) {
-    case OS_CMP_SAME: return C_GRN "Identical to the PC's save." C_RST;
-    case OS_CMP_DIFFERENT:
-        snprintf(buf, n, C_YEL "Different: %d only on the PC, %d only here, %d changed." C_RST, r->only_remote,
-                 r->only_local, r->differ);
-        return buf;
-    case OS_CMP_PC_LACKS:
-        snprintf(buf, n, C_YEL "The PC does not have this game yet.\n  %s\n  It has been offered to OpenSave on the PC: place it there first." C_RST,
-                 r->message);
-        return buf;
-    default: snprintf(buf, n, C_RED "Could not compare: %s" C_RST, r->message); return buf;
-    }
-}
+typedef struct {
+    ui_game_t v;
+    char status[80], detail[300];
+    const char *actions[4], *help[4];
+    int enabled[4];
+} game_t;
+static void d_game(gfx *g, void *a) { ui_game(g, &((game_t *)a)->v); }
+
+enum { ACT_RECEIVE, ACT_SEND, ACT_RESTORE, ACT_AGAIN };
 
 static void game_screen(const saves_title *t) {
-    char err[300], game_id[128], name[128], path[160], txt[600];
+    char err[300], game_id[128], name[128], path[160], backup[400];
     os_cmp_result cmp;
     os_remote_game rg;
     os_peer *p = the_peer();
-    int found = 0, refresh = 1;
+    game_t gv;
+    int found = 0, refresh = 1, sel = 0, i, actions[4], nact;
 
     if (!p) return;
+    memset(&gv, 0, sizeof gv);
     for (;;) {
         u64 d;
         if (refresh) {
-            consoleClear();
-            printf(C_CYN "%s" C_RST "\n%s\n\n", t->name, t->tid);
-            printf("Opening the save...\n");
-            consoleUpdate(NULL);
+            show_busy("Checking with the PC", t->name);
             if (saves_mount(t, &g_users[g_user], err, sizeof err) != 0) {
-                printf(C_RED "\n%s\n" C_RST, err);
-                wait_for_a();
+                show_result(UI_ERR, "Could not open this game's save", err);
                 return;
             }
-            printf("Asking the PC...\n");
-            consoleUpdate(NULL);
             os_game_id_for_title(game_id, sizeof game_id, t->tid);
             snprintf(name, sizeof name, "%s", t->name);
             os_save_path_for_title(path, sizeof path, t->tid);
             if (os_peer_find_title(&g_st, p, t->tid, &rg, &found, err, sizeof err) != 0) {
-                printf(C_RED "\nCould not reach the PC:\n%s\n" C_RST, err);
-                wait_for_a();
+                show_result(UI_ERR, "Could not reach the PC", err);
                 return;
             }
             if (found == 2) {
-                printf(C_YEL "\nThe PC tracks this game more than once. Link the right one\nin OpenSave on the PC (the game's Manage tab), then try again.\n" C_RST);
-                wait_for_a();
+                show_result(UI_WARN, "The PC tracks this game twice",
+                            "Link the right one in OpenSave on the PC (the game's Manage tab), then try again.");
                 return;
             }
-            if (found == 1) snprintf(game_id, sizeof game_id, "%s", rg.id); /* use the PC's own id */
+            if (found == 1) snprintf(game_id, sizeof game_id, "%s", rg.id); /* the PC's own id */
             os_compare(&g_st, p, game_id, name, path, SAVES_MOUNT_ROOT, &cmp);
-            consoleClear();
-            printf(C_CYN "%s" C_RST "\n%s   PC: %s\n\n", t->name, t->tid, p->name);
-            printf("%s\n\n", cmp_text(&cmp, txt, sizeof txt));
-            if (cmp.remote_has_extra_roots)
-                printf(C_YEL "The PC keeps extra save folders for this game; only the main one is synced.\n\n" C_RST);
-            if (cmp.state == OS_CMP_DIFFERENT || cmp.state == OS_CMP_SAME) {
-                printf(" A  Receive: replace this Switch's save with the PC's\n");
-                printf("      (the current save is backed up first)\n");
-                printf(" X  Send: give the PC this Switch's save\n");
+            newest_backup(t->tid, backup, sizeof backup);
+
+            memset(&gv, 0, sizeof gv);
+            gv.v.title = t->name;
+            gv.v.tid = t->tid;
+            gv.v.peer_name = p->name;
+            gv.v.only_pc = gv.v.only_here = gv.v.changed = -1;
+            switch (cmp.state) {
+            case OS_CMP_SAME:
+                gv.v.status_kind = UI_OK;
+                snprintf(gv.status, sizeof gv.status, "Identical to the PC's save");
+                break;
+            case OS_CMP_DIFFERENT:
+                gv.v.status_kind = UI_WARN;
+                snprintf(gv.status, sizeof gv.status, "The saves are different");
+                gv.v.only_pc = cmp.only_remote;
+                gv.v.only_here = cmp.only_local;
+                gv.v.changed = cmp.differ;
+                break;
+            case OS_CMP_PC_LACKS:
+                gv.v.status_kind = UI_WARN;
+                snprintf(gv.status, sizeof gv.status, "The PC does not have this game yet");
+                snprintf(gv.detail, sizeof gv.detail,
+                         "It was offered to OpenSave on the PC: choose its save folder there, then check again.");
+                break;
+            default:
+                gv.v.status_kind = UI_ERR;
+                snprintf(gv.status, sizeof gv.status, "Could not compare");
+                snprintf(gv.detail, sizeof gv.detail, "%s", cmp.message);
             }
-            printf(" Y  Restore the save from the last backup\n");
-            printf(" R  Check again          B  Back\n");
-            consoleUpdate(NULL);
+            gv.v.status = gv.status;
+            if (gv.detail[0]) gv.v.detail = gv.detail;
+            else if (cmp.remote_has_extra_roots) {
+                snprintf(gv.detail, sizeof gv.detail, "The PC keeps extra save folders for this game; only the main one syncs.");
+                gv.v.detail = gv.detail;
+            }
+
+            /* Only what can be done is offered. */
+            nact = 0;
+            if (cmp.state == OS_CMP_DIFFERENT) {
+                actions[nact++] = ACT_RECEIVE;
+                actions[nact++] = ACT_SEND;
+            }
+            if (backup[0]) actions[nact++] = ACT_RESTORE;
+            actions[nact++] = ACT_AGAIN;
+            for (i = 0; i < nact; i++) {
+                gv.enabled[i] = 1;
+                switch (actions[i]) {
+                case ACT_RECEIVE:
+                    gv.actions[i] = "Receive from the PC";
+                    gv.help[i] = "Replace this Switch's save with the PC's. The current one is backed up first.";
+                    break;
+                case ACT_SEND:
+                    gv.actions[i] = "Send to the PC";
+                    gv.help[i] = "Ask the PC to take this Switch's save.";
+                    break;
+                case ACT_RESTORE:
+                    gv.actions[i] = "Restore the last backup";
+                    gv.help[i] = "Put back the save from before the last receive.";
+                    break;
+                default:
+                    gv.actions[i] = "Check again";
+                    gv.help[i] = "Compare with the PC once more.";
+                }
+            }
+            gv.v.actions = gv.actions;
+            gv.v.action_help = gv.help;
+            gv.v.action_enabled = gv.enabled;
+            gv.v.nactions = nact;
+            if (sel >= nact) sel = 0;
             refresh = 0;
         }
+        gv.v.sel = sel;
         padUpdate(&g_pad);
         os_server_poll(&g_srv, 0);
         d = padGetButtonsDown(&g_pad);
         if (d & HidNpadButton_B) return;
-        if (d & HidNpadButton_R) refresh = 1;
-        if ((d & HidNpadButton_A) && (cmp.state == OS_CMP_DIFFERENT || cmp.state == OS_CMP_SAME)) {
-            consoleClear();
-            printf(C_RED "Replace this Switch's save for\n%s\nwith the PC's?" C_RST "\n\n", t->name);
-            printf("The current save is backed up on the SD card first.\n\n A  Replace    B  Cancel\n");
-            consoleUpdate(NULL);
-            if (confirm()) do_pull(t, game_id, name, path);
+        if ((d & HidNpadButton_Down) && sel + 1 < gv.v.nactions) sel++;
+        if ((d & HidNpadButton_Up) && sel > 0) sel--;
+        if (d & HidNpadButton_A) {
+            switch (actions[sel]) {
+            case ACT_RECEIVE:
+                if (confirm(d_game, &gv, UI_WARN, "Replace this Switch's save?",
+                            "The current save is backed up on the SD card first, so you can put it back.", NULL, "Replace",
+                            "Cancel"))
+                    do_pull(t, game_id, name, path);
+                break;
+            case ACT_SEND: do_push(game_id); break;
+            case ACT_RESTORE: do_restore(t, d_game, &gv); break;
+            default: break;
+            }
             refresh = 1;
         }
-        if ((d & HidNpadButton_X) && (cmp.state == OS_CMP_DIFFERENT || cmp.state == OS_CMP_SAME)) {
-            do_push(game_id);
-            refresh = 1;
-        }
-        if (d & HidNpadButton_Y) {
-            do_restore(t);
-            refresh = 1;
-        }
-        consoleUpdate(NULL);
+        frame(d_game, &gv);
     }
 }
 
-/* -------------------------------------------------------------------- main */
+/* ------------------------------------------------------------------- main */
+
+typedef enum { SCR_HOME, SCR_PAIR, SCR_GAMES } screen_t;
 
 int main(void) {
-    screen_t scr = SCR_MAIN;
+    screen_t scr = SCR_HOME;
     char err[300];
     os_server_hooks hooks;
+    home_t home;
+    int home_sel = 0;
+    NWindow *win;
 
-    consoleInit(NULL);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&g_pad);
+    win = nwindowGetDefault();
+    framebufferCreate(&g_fb, win, UI_W, UI_H, PIXEL_FORMAT_RGBA_8888, 2);
+    framebufferMakeLinear(&g_fb);
 
     if (R_FAILED(socketInitializeDefault())) {
-        printf(C_RED "Could not start networking.\n" C_RST);
-        goto fail;
+        show_result(UI_ERR, "Could not start networking", "Check the Wi-Fi settings and start OpenSave again.");
+        goto done;
     }
     if (saves_init() != 0) {
-        printf(C_RED "Could not start the game and account services.\n" C_RST);
-        goto fail;
+        show_result(UI_ERR, "Could not start the game services", "OpenSave needs to run with full access (Atmosphere).");
+        goto done;
     }
     g_nusers = saves_users(g_users, ACC_USER_LIST_SIZE);
     {
@@ -678,8 +782,8 @@ int main(void) {
                 if (memcmp(&g_users[i].uid, &pre, sizeof pre) == 0) g_user = i;
     }
     if (os_state_load(&g_st, CONFIG_PATH, err, sizeof err) != 0) {
-        printf(C_RED "Settings problem: %s\n" C_RST, err);
-        goto fail;
+        show_result(UI_ERR, "Settings problem", err);
+        goto done;
     }
     memset(&hooks, 0, sizeof hooks);
     hooks.open_save = hook_open_save;
@@ -689,10 +793,12 @@ int main(void) {
     hooks.on_peer_update = hook_peer_update;
     hooks.on_served = hook_served;
     if (os_server_start(&g_srv, &g_st, &hooks, g_st.port, err, sizeof err) != 0) {
-        printf(C_RED "Could not listen on port %d: %s\n" C_RST, g_st.port, err);
-        goto fail;
+        char msg[320];
+        snprintf(msg, sizeof msg, "Port %d: %s", g_st.port, err);
+        show_result(UI_ERR, "Could not start listening", msg);
+        goto done;
     }
-    load_games();
+    load_games(0);
 
     while (appletMainLoop()) {
         u64 down;
@@ -702,71 +808,82 @@ int main(void) {
         handle_incoming();
 
         switch (scr) {
-        case SCR_MAIN:
-            if (g_dirty) {
-                draw_main();
-                g_dirty = 0;
-            }
+        case SCR_HOME: {
+            int paired = the_peer() != NULL, n = paired ? 3 : 2;
+            if (home_sel >= n) home_sel = 0;
+            if ((down & HidNpadButton_Down) && home_sel + 1 < n) home_sel++;
+            if ((down & HidNpadButton_Up) && home_sel > 0) home_sel--;
             if (down & HidNpadButton_Plus) goto done;
             if (down & HidNpadButton_A) {
-                scr = the_peer() ? SCR_GAMES : SCR_PAIR;
-                g_dirty = 1;
+                if (paired && home_sel == 0) {
+                    scr = SCR_GAMES;
+                    memset(&g_gamesview, 0, sizeof g_gamesview);
+                } else if (paired && home_sel == 1) {
+                    do_unpair();
+                    if (!the_peer()) home_sel = 0;
+                } else if (!paired && home_sel == 0) {
+                    scr = SCR_PAIR;
+                } else {
+                    goto done; /* Exit */
+                }
             }
-            if ((down & HidNpadButton_Y) && the_peer()) {
-                do_unpair();
-                scr = SCR_PAIR; /* "pair with a different PC" */
-                g_dirty = 1;
-            }
+            build_home(&home, home_sel);
+            frame(d_home, &home);
             break;
+        }
         case SCR_PAIR:
-            if (g_dirty) {
-                draw_pair();
-                g_dirty = 0;
-            }
-            if (down & HidNpadButton_B) {
-                scr = SCR_MAIN;
-                g_dirty = 1;
-            } else if (down & HidNpadButton_A) {
+            if (down & HidNpadButton_B) scr = SCR_HOME;
+            else if (down & HidNpadButton_A) {
                 do_pair();
-                scr = SCR_MAIN;
-                g_dirty = 1;
-            } else if (pair_input(down)) {
-                g_dirty = 1;
+                scr = SCR_HOME;
+            } else {
+                pair_input(down);
             }
+            g_pairview.cursor = g_cursor;
+            memcpy(g_pairview.ip, g_ip, sizeof g_ip);
+            g_pairview.port = g_port;
+            frame(d_pair, NULL);
             break;
-        case SCR_GAMES:
-            if (g_dirty) {
-                draw_games();
-                g_dirty = 0;
-            }
+        case SCR_GAMES: {
+            static int sel, top;
+            int vis = ui_games_visible();
+            if (sel >= g_ntitles) sel = g_ntitles ? g_ntitles - 1 : 0;
+            if (top > sel) top = sel;
             if (down & HidNpadButton_B) {
                 saves_unmount();
-                scr = SCR_MAIN;
-                g_dirty = 1;
+                scr = SCR_HOME;
+                break;
             }
-            if ((down & HidNpadButton_Down) && g_sel + 1 < g_ntitles) {
-                g_sel++;
-                if (g_sel >= g_top + PAGE_ROWS) g_top = g_sel - PAGE_ROWS + 1;
-                g_dirty = 1;
-            }
-            if ((down & HidNpadButton_Up) && g_sel > 0) {
-                g_sel--;
-                if (g_sel < g_top) g_top = g_sel;
-                g_dirty = 1;
-            }
+            if ((down & HidNpadButton_Down) && sel + 1 < g_ntitles) sel++;
+            if ((down & HidNpadButton_Up) && sel > 0) sel--;
+            if ((down & HidNpadButton_Right) && sel + vis < g_ntitles) sel += vis; /* page down */
+            if ((down & HidNpadButton_Left) && sel > 0) sel = sel - vis < 0 ? 0 : sel - vis;
+            if (sel < top) top = sel;
+            if (sel >= top + vis) top = sel - vis + 1;
             if (down & (HidNpadButton_ZL | HidNpadButton_ZR)) {
                 if (g_nusers > 1) g_user = (g_user + 1) % g_nusers;
-                g_dirty = 1;
+                sel = top = 0;
+                load_games(0);
             }
+            if (down & HidNpadButton_R) {
+                sel = top = 0;
+                load_games(1);
+            }
+            memset(&g_gamesview, 0, sizeof g_gamesview);
+            g_gamesview.rows = g_rows;
+            g_gamesview.n = g_ntitles;
+            g_gamesview.sel = sel;
+            g_gamesview.top = top;
+            g_gamesview.user = g_nusers ? g_users[g_user].nickname : NULL;
+            g_gamesview.nusers = g_nusers;
             if ((down & HidNpadButton_A) && g_ntitles > 0) {
-                game_screen(&g_titles[g_sel]);
+                game_screen(&g_titles[sel]);
                 saves_unmount();
-                g_dirty = 1;
             }
+            frame(d_games, NULL);
             break;
-        default: scr = SCR_MAIN; break;
         }
-        consoleUpdate(NULL);
+        }
     }
 
 done:
@@ -774,16 +891,7 @@ done:
     saves_exit();
     socketExit();
     free(g_titles);
-    consoleExit(NULL);
+    free(g_rows);
+    framebufferClose(&g_fb);
     return 0;
-
-fail:
-    printf("\nPress + to exit.\n");
-    while (appletMainLoop()) {
-        padUpdate(&g_pad);
-        if (padGetButtonsDown(&g_pad) & HidNpadButton_Plus) break;
-        consoleUpdate(NULL);
-    }
-    consoleExit(NULL);
-    return 1;
 }

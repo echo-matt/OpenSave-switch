@@ -1,4 +1,5 @@
 #include "saves.h"
+#include "../core/titlecache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,49 +58,90 @@ static int by_name(const void *a, const void *b) {
     return strcasecmp(((const saves_title *)a)->name, ((const saves_title *)b)->name);
 }
 
-int saves_titles(saves_title **out, int *count) {
+#define TITLE_CACHE_PATH "sdmc:/config/opensave/titles.json"
+
+/* Reads one game's name and save kinds from the system. Only the first part of
+ * the control record is needed (the rest is the icon), so a small buffer is
+ * tried first; if the service refuses that, the whole record is asked for. */
+static int read_control(NsApplicationControlData *ctrl, u64 id, os_tcache_entry *out) {
+    u64 got = 0;
+    NacpLanguageEntry *le = NULL;
+    Result rc;
+
+    memset(&ctrl->nacp, 0, sizeof ctrl->nacp);
+    rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, id, ctrl, sizeof ctrl->nacp, &got);
+    if (R_FAILED(rc) || got < sizeof ctrl->nacp)
+        rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, id, ctrl, sizeof *ctrl, &got);
+    if (R_FAILED(rc) || got < sizeof ctrl->nacp) return -1;
+
+    memset(out, 0, sizeof *out);
+    out->id = id;
+    snprintf(out->name, sizeof out->name, "%016lX", (unsigned long)id);
+    if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
+        snprintf(out->name, sizeof out->name, "%s", le->name);
+    out->user = ctrl->nacp.user_account_save_data_size > 0;
+    out->device = ctrl->nacp.device_save_data_size > 0;
+    return 0;
+}
+
+int saves_titles(saves_title **out, int *count, int rescan, saves_progress_fn progress, void *ctx) {
     NsApplicationRecord *recs = (NsApplicationRecord *)malloc(sizeof(NsApplicationRecord) * MAX_RECORDS);
-    NsApplicationControlData *ctrl = (NsApplicationControlData *)malloc(sizeof(NsApplicationControlData));
+    NsApplicationControlData *ctrl = NULL;
     saves_title *list = (saves_title *)calloc(MAX_RECORDS, sizeof(saves_title));
+    u64 *ids = (u64 *)malloc(sizeof(u64) * MAX_RECORDS);
+    os_tcache cache;
     s32 n = 0;
-    int i, kept = 0;
+    int i, kept = 0, misses = 0, done = 0;
 
     *out = NULL;
     *count = 0;
-    if (!recs || !ctrl || !list) {
+    if (!recs || !list || !ids || R_FAILED(nsListApplicationRecord(recs, MAX_RECORDS, 0, &n))) {
         free(recs);
-        free(ctrl);
         free(list);
+        free(ids);
         return -1;
     }
-    if (R_FAILED(nsListApplicationRecord(recs, MAX_RECORDS, 0, &n))) {
-        free(recs);
-        free(ctrl);
-        free(list);
-        return -1;
-    }
-    for (i = 0; i < n; i++) {
-        u64 got = 0;
-        saves_title *t = &list[kept];
-        NacpLanguageEntry *le = NULL;
+    os_tcache_init(&cache, TITLE_CACHE_PATH);
+    if (rescan) os_tcache_clear(&cache);
 
-        t->id = recs[i].application_id;
-        snprintf(t->tid, sizeof t->tid, "%016lX", (unsigned long)t->id);
-        snprintf(t->name, sizeof t->name, "%s", t->tid);
-        memset(ctrl, 0, sizeof *ctrl);
-        if (R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_Storage, t->id, ctrl,
-                                                 sizeof *ctrl, &got)) ||
-            got < sizeof ctrl->nacp) {
-            continue; /* no control data: cannot tell what it saves, so skip it */
-        }
-        if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
-            snprintf(t->name, sizeof t->name, "%s", le->name);
-        t->has_user_save = ctrl->nacp.user_account_save_data_size > 0;
-        t->has_device_save = ctrl->nacp.device_save_data_size > 0;
-        if (t->has_user_save || t->has_device_save) kept++;
+    for (i = 0; i < n; i++) {
+        ids[i] = recs[i].application_id;
+        if (!os_tcache_find(&cache, ids[i])) misses++;
     }
+    if (misses) {
+        ctrl = (NsApplicationControlData *)malloc(sizeof(NsApplicationControlData));
+        if (!ctrl) misses = -1; /* cannot look anything new up; the cache still serves what it has */
+    }
+
+    for (i = 0; i < n; i++) {
+        const os_tcache_entry *c = os_tcache_find(&cache, ids[i]);
+        os_tcache_entry fresh;
+        if (!c) {
+            if (misses <= 0) continue;
+            if (progress) progress(ctx, done, misses);
+            done++;
+            if (read_control(ctrl, ids[i], &fresh) != 0) continue; /* not cached: tried again next time */
+            os_tcache_put(&cache, &fresh);
+            c = os_tcache_find(&cache, ids[i]);
+            if (!c) continue;
+        }
+        if (!c->user && !c->device) continue;
+        list[kept].id = c->id;
+        snprintf(list[kept].tid, sizeof list[kept].tid, "%016lX", (unsigned long)c->id);
+        snprintf(list[kept].name, sizeof list[kept].name, "%s", c->name);
+        list[kept].has_user_save = c->user;
+        list[kept].has_device_save = c->device;
+        kept++;
+    }
+    if (progress && misses > 0) progress(ctx, misses, misses);
+
+    /* Games that are gone leave the cache; a failed write only costs speed. */
+    os_tcache_retain(&cache, (const uint64_t *)ids, n);
+    os_tcache_save(&cache);
+    os_tcache_free(&cache);
     free(recs);
     free(ctrl);
+    free(ids);
     qsort(list, (size_t)kept, sizeof *list, by_name);
     *out = list;
     *count = kept;

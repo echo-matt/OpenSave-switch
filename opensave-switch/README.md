@@ -33,21 +33,31 @@ homebrew menu. (Download it from the CI run's artifacts, or build it: see below.
 
 ## Use
 
-1. **Pair.** On the PC, open OpenSave and keep it running. On the Switch press
-   **A**, enter the PC's local address (for example `192.168.1.20`; `ipconfig`
-   shows it) and port, and press **A**. In OpenSave on the PC, **approve** the
-   request under Devices.
+The interface is dark and minimal: a menu, a list of games, and one screen per
+game. Every screen shows its buttons along the bottom.
+
+1. **Pair.** On the PC, open OpenSave and keep it running. On the Switch choose
+   **Pair with a PC**, set the PC's local address with the D-pad (for example
+   `192.168.1.20`; `ipconfig` shows it) and press **A**. In OpenSave on the PC,
+   **approve** the request under Devices.
    Both screens now show a **fingerprint**. They must match: it is what rules out
    someone else on the network sitting between the two. If they differ, unpair
    on both.
-2. **Pick a game** on the Switch (**A** on the main screen). The Switch compares
-   its save with the PC's and shows whether they are identical or different.
-3. **Receive** (**A**): replaces the Switch's save with the PC's. The current save
-   is copied to the SD card first and the copy is verified. 
-   **Send** (**X**): asks the PC to take the Switch's save. The PC then reads it
-   from the Switch, so keep the screen open until it finishes. If both sides
-   changed since they last agreed, OpenSave on the PC asks which to keep.
-   **Restore** (**Y**): puts the last backup back.
+2. **Pick a game** (**Games**). The list shows every installed game that keeps
+   save data. **ZL** switches user account, **R** rescans the games. Open one
+   and the Switch compares its save with the PC's.
+3. **Choose what to do:**
+   - **Receive from the PC** replaces the Switch's save with the PC's. The
+     current save is copied to the SD card first and the copy is verified.
+   - **Send to the PC** asks the PC to take the Switch's save. The PC then reads
+     it from the Switch, so keep the screen open until it finishes. If both sides
+     changed since they last agreed, OpenSave on the PC asks which to keep.
+   - **Restore the last backup** puts the previous save back.
+
+The first time the games are listed the app asks the system about each one, which
+is slow; it keeps the answers in `sdmc:/config/opensave/titles.json`, so later
+launches only look up games installed since. **R** on the games list discards the
+cache and starts again (use it if a game's name looks wrong).
 
 For the PC to know which of its games a Switch save belongs to, it needs the
 game's **title ID**. OpenSave reads it from the folder layout the yuzu family of
@@ -93,6 +103,7 @@ Things to know:
   backup is for.
 - Only a game's main save location syncs. If the PC tracks extra folders for the
   game, the app says so.
+- Game titles are drawn in ASCII: a title in another script shows as `?`.
 - File names must be plain ASCII; a save with other names is refused rather than
   risk writing a different name than the PC meant.
 
@@ -106,6 +117,8 @@ Things to know:
 | Everything on the wire | `e2e/`: the C client runs against a **real in-process OpenSave daemon**: pairing in both directions (with the fingerprints compared), compare, pull with backup, push, restore, unpairing, and attacks on the Switch's server (unsigned, forged, replayed, re-aimed and stale requests; path traversal; remote deletion) |
 | Failure | A proxy truncates a reply and flips a byte in a block; the pull fails and the save is byte-for-byte unchanged |
 | Memory safety | All C tests run under AddressSanitizer and UBSan |
+| Interface | Every screen is rendered to an image by a PC test (under AddressSanitizer, so any drawing outside the screen fails it) and was looked at; frame cost is measured |
+| Title cache | Unit tests: round trip, replace, drop uninstalled games, damaged and wrong-version files |
 | Console layer | Type-checked against stand-in libnx headers (`make -f Makefile.host check-switch`) — which only checks this project's own code — and built with the real toolchain in CI. **Not run on hardware.** |
 
 ## Build and test
@@ -133,8 +146,10 @@ console.
 ## Layout
 
 ```
-core/      portable C: crypto, JSON, HTTP, manifests, pairing state, client, server, sync
-switch/    the console layer: save mounting (libnx), the on-screen interface
+core/      portable C: crypto, JSON, HTTP, manifests, pairing state, client, server, sync, title cache
+ui/        portable renderer and screens (drawn into a pixel buffer; ASCII font generated from
+           Liberation Sans, licence in FONT-LICENSE.txt)
+switch/    the console layer: save mounting and the game list (libnx), the input loop
 tools/     hostcli (terminal driver); Go helpers that produce the expected values for tests
 tests/     unit tests and the vectors they check against
 e2e/       Go end-to-end tests against a real daemon
