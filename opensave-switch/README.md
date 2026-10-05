@@ -61,10 +61,19 @@ cache and starts again (use it if a game's name looks wrong).
 
 For the PC to know which of its games a Switch save belongs to, it needs the
 game's **title ID**. OpenSave reads it from the folder layout the yuzu family of
-emulators uses (`…/save/<account>/<profile>/<title id>`). A game the PC does not
-track yet is **offered** on its Home screen: choose the folder there, then try
-again. An emulator that keeps saves elsewhere needs the game linked by hand in
-OpenSave's Manage tab.
+emulators uses (`.../save/<account>/<profile>/<title id>`).
+
+Looking at a game never changes anything on the PC. If the PC does not track the
+game, the Switch says so and offers **Offer to the PC**: that lists the game on
+the PC's Home screen, where you choose its save folder. Do that only for a game
+whose Switch save you have in an emulator on the PC; the PC will not guess a
+folder for it. An emulator that keeps saves elsewhere needs the game linked by
+hand in OpenSave's Manage tab.
+
+A PC game with the same name is not the same save: the Windows version of a game
+(for example Minecraft Dungeons) keeps a differently shaped save from the Switch
+version, and the two cannot be swapped. The Switch only syncs with the *Switch*
+save of that title, as an emulator stores it.
 
 Backups are in `sdmc:/switch/OpenSave/backups/<title id>/<timestamp>/` (the three
 newest are kept). Settings and this device's key are in
