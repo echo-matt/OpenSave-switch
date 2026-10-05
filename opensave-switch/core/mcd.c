@@ -425,7 +425,7 @@ int os_mcd_pull(os_state *s, const os_peer *p, const os_link *l, const char *sav
     res->files = nwant;
     res->bytes = done;
 
-    /* Work out every Switch file to write, decrypting first, so that a failure of
+    /* Work out every Switch file to write, decrypting first, so that
      * a failure leaves nothing touched. */
     convs = (conv *)calloc((size_t)(rm.manifest.nfiles ? rm.manifest.nfiles : 1), sizeof *convs);
     if (!convs) {
