@@ -367,6 +367,7 @@ int os_http_request_tls(const char *host, int port, int tls, const char *method,
     header_in(in.d, "Content-Length", clen, sizeof clen);
     header_in(in.d, "Transfer-Encoding", te, sizeof te);
     if (header_in(in.d, "Date", datehdr, sizeof datehdr) == 0) out->server_time = os_http_parse_date(datehdr);
+    header_in(in.d, "Location", out->location, sizeof out->location);
     chunked = strncasecmp(te, "chunked", 7) == 0;
     if (clen[0]) {
         char *e;

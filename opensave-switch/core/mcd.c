@@ -73,6 +73,55 @@ static int parse_url(const char *url, int *tls, char *host, size_t hl, int *port
     return 0;
 }
 
+/* The host without a leading "www.", for comparing sites. */
+static const char *bare_host(const char *h) { return strncasecmp(h, "www.", 4) == 0 ? h + 4 : h; }
+
+/* Accepts a redirect's Location only if it stays on the same site: the same
+ * scheme (never https to http), and the same host or its www. form. Updates the
+ * request target. Returns 0 if it may be followed. */
+static int follow_redirect(const char *loc, int *tls, char *host, size_t hl, int *port, char *target, size_t tl,
+                           const char *first_host) {
+    int ntls = *tls, nport = *port;
+    char nhost[128], path[300];
+    const char *p = loc;
+    if (!loc[0]) return -1;
+    if (loc[0] == '/') { /* a path on the same host */
+        snprintf(target, tl, "%s", loc);
+        return 0;
+    }
+    if (strncmp(p, "https://", 8) == 0) {
+        ntls = 1;
+        p += 8;
+        nport = 443;
+    } else if (strncmp(p, "http://", 7) == 0) {
+        ntls = 0;
+        p += 7;
+        nport = 80;
+    } else {
+        return -1;
+    }
+    if (ntls != *tls) return -1; /* never change scheme: no downgrade, and no surprise upgrade */
+    {
+        size_t n = strcspn(p, "/:");
+        if (n == 0 || n >= sizeof nhost) return -1;
+        memcpy(nhost, p, n);
+        nhost[n] = '\0';
+        p += n;
+    }
+    if (*p == ':') {
+        nport = atoi(p + 1);
+        p += 1 + strspn(p + 1, "0123456789");
+        if (nport <= 0 || nport > 65535) return -1;
+    }
+    snprintf(path, sizeof path, "%s", *p ? p : "/");
+    if (strcasecmp(bare_host(nhost), bare_host(first_host)) != 0) return -1;
+    snprintf(host, hl, "%s", nhost);
+    *port = nport;
+    *tls = ntls;
+    snprintf(target, tl, "%s", path);
+    return 0;
+}
+
 /* Decodes base64 whether or not its padding is present: the service leaves it off. */
 static int b64_loose(const char *in, uint8_t **out, size_t *outn) {
     size_t n = strlen(in), padded;
@@ -139,13 +188,31 @@ static int service_call(const char *base, const char *endpoint, const char *send
         seterr(err, errlen, "out of memory");
         return -1;
     }
-    if (os_http_request_tls(host, port, tls, "POST", target, NULL, 0, body, bl, 8 * 1000 * 1000, 30000, &r, terr,
-                            sizeof terr) != 0) {
+    {
+        /* A redirect is followed — with the same body, as a POST — but only to the
+         * same site: another host would be sending a save wherever a server says. */
+        char first_host[128];
+        int hops;
+        snprintf(first_host, sizeof first_host, "%s", host);
+        for (hops = 0;; hops++) {
+            if (os_http_request_tls(host, port, tls, "POST", target, NULL, 0, body, bl, 8 * 1000 * 1000, 30000, &r, terr,
+                                    sizeof terr) != 0) {
+                free(body);
+                snprintf(err, errlen, "could not reach the conversion service: %s", terr);
+                return -1;
+            }
+            if (!(r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308)) break;
+            if (hops >= 3 || follow_redirect(r.location, &tls, host, sizeof host, &port, target, sizeof target, first_host) != 0) {
+                snprintf(err, errlen, "the conversion service redirected to %s%s", r.location[0] ? r.location : "(nowhere)",
+                         hops >= 3 ? ", too many times" : ", which is not the same site, so nothing was sent there");
+                os_http_resp_free(&r);
+                free(body);
+                return -1;
+            }
+            os_http_resp_free(&r);
+        }
         free(body);
-        snprintf(err, errlen, "could not reach the conversion service: %s", terr);
-        return -1;
     }
-    free(body);
     status_ok = r.status == 200;
     if (!status_ok) {
         snprintf(err, errlen, "the conversion service answered HTTP %d", r.status);

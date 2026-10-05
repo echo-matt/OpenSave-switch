@@ -30,6 +30,7 @@ type convService struct {
 	srv      *httptest.Server
 	key      []byte
 	down     atomic.Bool
+	offsite  atomic.Int32 // requests that reached the service under a different host name
 	garbage  atomic.Bool
 	requests atomic.Int32
 }
@@ -69,6 +70,31 @@ func unb64(s string) []byte {
 
 func (c *convService) handle(w http.ResponseWriter, r *http.Request) {
 	c.requests.Add(1)
+	if strings.HasPrefix(r.Host, "localhost") {
+		c.offsite.Add(1)
+	}
+	// Redirect routes, to test how the client follows them: the real service
+	// answered the first call with HTTP 301.
+	redirect := func(prefix, loc string) bool {
+		if !strings.HasPrefix(r.URL.Path, prefix) {
+			return false
+		}
+		w.Header().Set("Location", loc+strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(prefix, "/")))
+		w.WriteHeader(301)
+		return true
+	}
+	switch {
+	case redirect("/old/", ""): // a path on the same host
+		return
+	case redirect("/abs/", c.srv.URL): // an absolute address on the same host
+		return
+	case redirect("/evil/", strings.Replace(c.srv.URL, "127.0.0.1", "localhost", 1)): // another host name
+		return
+	case strings.HasPrefix(r.URL.Path, "/loop/"):
+		w.Header().Set("Location", r.URL.Path)
+		w.WriteHeader(301)
+		return
+	}
 	if c.down.Load() {
 		http.Error(w, "down", 503)
 		return
@@ -297,5 +323,52 @@ func TestMcdFailuresLeaveEverythingAlone(t *testing.T) {
 	e2 := newMcdEnv(t)
 	if out := e2.run(30*time.Second, "mcd-send", mcdTitle, "1"); !strings.Contains(out, "Receive from the PC first") {
 		t.Fatalf("send before receive: %s", out)
+	}
+}
+
+// TestMcdRedirects: the real service answered its first call with HTTP 301.
+// A redirect to the same site is followed (re-sending the body as a POST); one to
+// another site is refused without sending anything; a loop stops.
+func TestMcdRedirects(t *testing.T) {
+	e := newMcdEnv(t)
+	base := e.svc.srv.URL
+	pull := func(prefix string) string {
+		return e.sw.run(90*time.Second, "--service", base+prefix, "mcd-pull", mcdTitle, "2")
+	}
+	swBefore := snapshot(t, filepath.Join(e.sw.saves, mcdTitle))
+
+	// Another site: refused, and the target is named so the person can see it.
+	out := pull("/evil/")
+	if !strings.Contains(out, "MCD-PULL FAIL") || !strings.Contains(out, "redirected to http://localhost") || !strings.Contains(out, "not the same site") {
+		t.Fatalf("an off-site redirect should be refused and say where to: %s", out)
+	}
+	if n := e.svc.offsite.Load(); n != 0 {
+		t.Fatalf("%d requests (a save) were sent to the other site", n)
+	}
+	// A loop gives up.
+	if out := pull("/loop/"); !strings.Contains(out, "MCD-PULL FAIL") || !strings.Contains(out, "too many times") {
+		t.Fatalf("a redirect loop should stop: %s", out)
+	}
+	if !sameSnapshot(swBefore, snapshot(t, filepath.Join(e.sw.saves, mcdTitle))) {
+		t.Fatal("the Switch save changed although the service could not be used")
+	}
+
+	// The same site, by absolute address and by path: followed, and it works.
+	if out := pull("/abs/"); !strings.Contains(out, "MCD-PULL OK same=0 converted=2") {
+		t.Fatalf("an absolute same-site redirect should be followed: %s", out)
+	}
+	if !sameJ(e.readSw("Character"+guidA), character(guidA, 100)) {
+		t.Fatal("the redirected conversion gave the wrong character")
+	}
+	os.WriteFile(e.swPath("Character"+guidA), character(guidA, 321), 0o666)
+	p := e.sw.start("--service", base+"/old/", "mcd-send", mcdTitle, "20")
+	if line := p.waitFor("MCD-SEND TRIGGERED", 60*time.Second); !strings.Contains(line, "prepared=1") {
+		t.Fatalf("a relative same-site redirect should be followed when sending: %s", line)
+	}
+	if !testutil.WaitFor(40*time.Second, func() bool {
+		raw := e.pcFile(e.chars + "/" + guidA + ".dat")
+		return bytes.HasPrefix(raw, magicDat) && sameJ(e.svc.undat(raw), character(guidA, 321))
+	}) {
+		t.Fatal("the PC never received the character sent through a redirect")
 	}
 }

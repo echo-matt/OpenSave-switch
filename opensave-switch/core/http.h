@@ -23,6 +23,7 @@ typedef struct {
     char *body; /* NUL-terminated for convenience; bodylen excludes the NUL */
     size_t bodylen;
     int64_t server_time; /* unix seconds from the Date header; 0 if absent */
+    char location[300];  /* the Location header of a redirect, or "" */
 } os_http_resp;
 
 void os_http_resp_free(os_http_resp *r);
