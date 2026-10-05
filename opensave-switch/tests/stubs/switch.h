@@ -109,13 +109,13 @@ void sslExit(void);
 Result sslCreateContext(SslContext *c, int version);
 void sslContextClose(SslContext *c);
 Result sslContextCreateConnection(SslContext *c, SslConnection *out);
-Result sslConnectionSetSocketDescriptor(SslConnection *c, int fd);
+Result sslConnectionSetSocketDescriptor(SslConnection *c, int sockfd, int *out_sockfd); /* as in libnx */
 Result sslConnectionSetHostName(SslConnection *c, const char *name, u32 len);
 Result sslConnectionSetVerifyOption(SslConnection *c, int opt);
 Result sslConnectionSetIoMode(SslConnection *c, int mode);
 Result sslConnectionDoHandshake(SslConnection *c, u32 *out_size, u32 *total_certs, void *buf, u32 bufsize);
-Result sslConnectionRead(SslConnection *c, void *buf, size_t size, s32 *out);
-Result sslConnectionWrite(SslConnection *c, const void *buf, size_t size, s32 *out);
+Result sslConnectionRead(SslConnection *c, void *buffer, u32 size, u32 *out_size);
+Result sslConnectionWrite(SslConnection *c, const void *buffer, u32 size, u32 *out_size);
 void sslConnectionClose(SslConnection *c);
 
 #endif

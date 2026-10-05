@@ -26,6 +26,7 @@ static void *tls_open(int fd, const char *host, char *err, size_t errlen) {
     session *s = (session *)calloc(1, sizeof *s);
     Result rc;
     u32 out_size = 0, total_certs = 0;
+    int out_fd = -1;
 
     if (!s) {
         snprintf(err, errlen, "out of memory");
@@ -39,7 +40,7 @@ static void *tls_open(int fd, const char *host, char *err, size_t errlen) {
     }
     s->open = 1;
     /* Check the certificate chain AND that it is for this host name. */
-    rc = sslConnectionSetSocketDescriptor(&s->conn, fd);
+    rc = sslConnectionSetSocketDescriptor(&s->conn, fd, &out_fd);
     if (R_SUCCEEDED(rc)) rc = sslConnectionSetHostName(&s->conn, host, (u32)strlen(host));
     if (R_SUCCEEDED(rc)) rc = sslConnectionSetVerifyOption(&s->conn, SslVerifyOption_PeerCa | SslVerifyOption_HostName);
     if (R_SUCCEEDED(rc)) rc = sslConnectionSetIoMode(&s->conn, SslIoMode_Blocking);
@@ -57,16 +58,18 @@ static void *tls_open(int fd, const char *host, char *err, size_t errlen) {
 
 static int tls_send(void *t, const void *buf, size_t len) {
     session *s = (session *)t;
-    s32 n = 0;
-    if (R_FAILED(sslConnectionWrite(&s->conn, buf, len, &n))) return -1;
-    return n;
+    u32 n = 0;
+    if (len > 0x10000) len = 0x10000; /* the service takes 32-bit sizes; keep each call modest */
+    if (R_FAILED(sslConnectionWrite(&s->conn, buf, (u32)len, &n))) return -1;
+    return (int)n;
 }
 
 static int tls_recv(void *t, void *buf, size_t len) {
     session *s = (session *)t;
-    s32 n = 0;
-    if (R_FAILED(sslConnectionRead(&s->conn, buf, len, &n))) return -1;
-    return n;
+    u32 n = 0;
+    if (len > 0x10000) len = 0x10000;
+    if (R_FAILED(sslConnectionRead(&s->conn, buf, (u32)len, &n))) return -1;
+    return (int)n;
 }
 
 static void tls_close(void *t) {
